@@ -324,7 +324,7 @@ class NoEyesServer:
     ) -> None:
         msg_type = header.get("type", "")
 
-        # Rate limiting (skip heartbeats)
+        # Rate limiting — skip for heartbeats (they're dropped anyway)
         if msg_type != "heartbeat":
             if not conn.check_rate_limit(self.rate_limit):
                 await conn.send({
@@ -334,9 +334,9 @@ class NoEyesServer:
                 })
                 return
 
-        # Heartbeat ping — echo back
+        # Heartbeat from client — it's an ACK, just drop it silently.
+        # Do NOT echo back or we create an infinite ping-pong loop.
         if msg_type == "heartbeat":
-            await conn.send({"type": "heartbeat", "ts": _now_ts()})
             return
 
         # Pubkey announcement — store and rebroadcast to room
