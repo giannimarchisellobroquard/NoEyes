@@ -223,6 +223,19 @@ def run_tests() -> None:
 
         os.unlink(testfile.name)
 
+        # ---- Test 7: pairwise key survives room switch ----
+        print("[selftest] Testing /msg after room switch…")
+        ROOM_MSG = "still_works_after_room_switch"
+        # Alice switches room then sends a privmsg to bob
+        alice_proc.stdin.write(b"/join testroom\n"); alice_proc.stdin.flush()
+        time.sleep(1.0)
+        alice_proc.stdin.write(f"/msg {BOB} {ROOM_MSG}\n".encode()); alice_proc.stdin.flush()
+        if bob_reader.wait_for(ROOM_MSG, timeout=8):
+            print("[PASS] Test 7 — Pairwise key survived room switch; Bob received privmsg.")
+        else:
+            print("[FAIL] Test 7 — Pairwise key was lost after room switch.")
+            failures.append("pairwise key lost on room switch")
+
     finally:
         # ---- Teardown ----
         for proc in procs:
@@ -250,7 +263,7 @@ def run_tests() -> None:
         print(f"[FAIL] {len(failures)} check(s) FAILED: {', '.join(failures)}")
         sys.exit(1)
     else:
-        print("[PASS] All 6 acceptance checks passed.")
+        print("[PASS] All 7 acceptance checks passed.")
 
 
 if __name__ == "__main__":

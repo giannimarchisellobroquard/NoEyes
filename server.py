@@ -469,12 +469,13 @@ class NoEyesServer:
         new_room = str(header.get("room", "general")).strip()[:64]
         old_room = conn.room
 
-        # Leave old room
+        # Leave old room — reason:"room_change" tells clients NOT to wipe pairwise keys
         leave_event = {
             "type":     "system",
             "event":    "leave",
             "username": conn.username,
             "room":     old_room,
+            "reason":   "room_change",
             "ts":       _now_ts(),
         }
         self._broadcast_room(old_room, leave_event, b"", exclude=conn.username, record=False)

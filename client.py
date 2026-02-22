@@ -215,6 +215,11 @@ class NoEyesClient:
         utils.clear_screen()
         utils.print_banner()
 
+        # Pre-create all receive folders so they exist on every platform
+        # (including Android/Termux) before any transfer happens.
+        for subfolder in ("images", "videos", "audio", "docs", "other"):
+            (RECEIVE_BASE / subfolder).mkdir(parents=True, exist_ok=True)
+
         backoff = 2
         while True:
             if not self.connect():
@@ -725,11 +730,17 @@ class NoEyesClient:
             uname = header.get("username", "?")
             print(utils.format_system(f"{uname} has joined the chat.", ts))
         elif event == "leave":
-            uname = header.get("username", "?")
-            print(utils.format_system(f"{uname} has left the chat.", ts))
-            # Clear pairwise state for departed user
-            self._pairwise.pop(uname, None)
-            self._dh_pending.pop(uname, None)
+            uname  = header.get("username", "?")
+            reason = header.get("reason", "disconnect")
+            if reason == "room_change":
+                print(utils.format_system(f"{uname} switched rooms.", ts))
+                # Pairwise key is preserved — they're still online, just in another room.
+                # /msg and /send will still work across rooms.
+            else:
+                print(utils.format_system(f"{uname} has left the chat.", ts))
+                # Real disconnect — clear pairwise state so stale keys don't accumulate.
+                self._pairwise.pop(uname, None)
+                self._dh_pending.pop(uname, None)
         elif event == "nick":
             old = header.get("old_nick", "?")
             new = header.get("new_nick", "?")
