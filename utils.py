@@ -3,21 +3,27 @@
 utils.py — Terminal utilities, ANSI colors, and the NoEyes ASCII banner.
 """
 
-import os
 import sys
+import os
+import time
+import random
+import re
+import threading
 
 # ---------------------------------------------------------------------------
 # ANSI color helpers
 # ---------------------------------------------------------------------------
 
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-RED    = "\033[31m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-CYAN   = "\033[36m"
-WHITE  = "\033[37m"
-GREY   = "\033[90m"
+RESET        = "\033[0m"
+BOLD         = "\033[1m"
+RED          = "\033[31m"
+GREEN        = "\033[32m"
+YELLOW       = "\033[33m"
+CYAN         = "\033[36m"
+WHITE        = "\033[37m"
+GREY         = "\033[90m"
+PURPLE       = "\033[35m"
+BRIGHT_WHITE = "\033[1;37m"
 
 
 def colorize(text: str, color: str, bold: bool = False) -> str:
@@ -59,7 +65,7 @@ def clear_screen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ASCII banner  (keep / restore as required by acceptance tests)
+# ASCII banner
 # ---------------------------------------------------------------------------
 
 BANNER = r"""
@@ -79,63 +85,154 @@ def print_banner() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Connect animation — TTE decrypt effect (bundled, graceful fallback)
+# Decrypt animation
+#
+# Two-phase cinematic effect on every incoming message:
+#
+#   Phase 1 — CIPHER: exactly len(plaintext) random characters from a
+#              cinematic noise pool stream out in shifting purple/magenta.
+#              Each char picks a different shade — not a flat block of colour.
+#
+#   Phase 2 — REVEAL: cursor rewinds (save/restore — works after line-wrap)
+#              and the real plaintext types over the cipher position-by-
+#              position.  Each character flashes bright-white for one tick
+#              then settles to normal: the "lock-in" feel.
+#
+# A threading.Lock() serialises concurrent messages so two animations never
+# interleave.  chat and privmsg share a single _run_animation() core.
+#
+# Toggle: /anim on|off  (stored in NoEyesClient._anim_enabled)
+# Non-TTY: animation skipped entirely — plain print, no side effects.
 # ---------------------------------------------------------------------------
 
-def play_connect_animation(host: str, username: str) -> None:
-    """
-    Play a decrypt-style animation when a secure connection is established.
+# Character pool — box-drawing, block-elements, braille dots, symbol noise.
+# No letters/digits: looks like encrypted noise, not garbled plaintext.
+_CIPHER_POOL = list(
+    "─│┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬═║╒╓╕╖╘╙╛╜╞╟╡╢╤╥╧╨╪╫"
+    "░▒▓█▀▄▌▐▖▗▘▙▚▛▜▝▞▟"
+    "⠿⠾⠽⠻⠷⠯⠟⡿⢿"
+    "!#$%&*+/<=>?@^~|*+-=<>{}[]"
+    "·×÷±∑∏∂∇∞∴≈≠≡≤≥"
+)
 
-    Uses the bundled `terminaltexteffects` package (the folder lives next to
-    this file — no pip install needed).  Falls back to a plain green print if
-    the terminal is not a TTY (e.g. during selftest / piped output) or if
-    anything goes wrong.
+# Purple/blue/teal shades — each cipher char picks one randomly
+_CIPHER_COLORS = [
+    "\033[35m",    # purple
+    "\033[1;35m",  # bright purple
+    "\033[95m",    # light magenta
+    "\033[34m",    # dark blue
+    "\033[1;34m",  # bright blue
+    "\033[36m",    # teal
+]
+
+# ── Timing ──────────────────────────────────────────────────────────────────
+_CIPHER_CHAR_DELAY = 0.022   # s per cipher char
+_REVEAL_PAUSE      = 0.38    # s pause between phases (the "moment of decryption")
+_PLAIN_CHAR_MAX    = 0.060   # s per plaintext char (cap for short messages)
+_PLAIN_TOTAL_CAP   = 2.0     # s max total for the whole plaintext phase
+_FLASH_DUR         = 0.028   # s a char stays bright-white before settling
+
+# VT100 cursor save/restore — supported by every modern terminal
+_CUR_SAVE    = "\033[s"
+_CUR_RESTORE = "\033[u"
+_CUR_BACK1   = "\033[1D"
+_ERASE_EOL   = "\033[K"
+
+# Serialise all animation writes so concurrent arrivals never interleave
+_ANIM_LOCK = threading.Lock()
+
+
+def _run_animation(prefix: str, plaintext: str) -> None:
     """
-    if not sys.stdout.isatty():
+    Core two-phase animation.  Called with _ANIM_LOCK already held.
+
+    prefix    — formatted '[ts] user: ' string (may contain ANSI codes)
+    plaintext — decrypted message text
+    """
+    n = len(plaintext)
+    if n == 0:
+        sys.stdout.write(prefix + "\n")
+        sys.stdout.flush()
         return
 
-    text = (
-        "\n"
-        "  ╔══════════════════════════════════════════╗\n"
-        "  ║                                          ║\n"
-        "  ║   ✓  SECURE CONNECTION ESTABLISHED       ║\n"
-        "  ║                                          ║\n"
-        f"  ║   host  :  {host:<29} ║\n"
-        f"  ║   user  :  {username:<29} ║\n"
-        "  ║   cipher:  X25519 + Fernet / Ed25519     ║\n"
-        "  ║                                          ║\n"
-        "  ╚══════════════════════════════════════════╝\n"
-        "\n"
-    )
+    # ── Phase 1: cipher noise, exactly n chars ───────────────────────────────
+    # Print prefix then save cursor position so Phase 2 can rewind even if
+    # the cipher chars caused the line to wrap.
+    sys.stdout.write(prefix + _CUR_SAVE)
+    sys.stdout.flush()
 
-    try:
-        # Make sure the bundled folder is on the path regardless of cwd.
-        import pathlib as _pl
-        _here = str(_pl.Path(__file__).parent)
-        if _here not in sys.path:
-            sys.path.insert(0, _here)
+    for _ in range(n):
+        ch    = random.choice(_CIPHER_POOL)
+        color = random.choice(_CIPHER_COLORS)
+        sys.stdout.write(color + ch + RESET)
+        sys.stdout.flush()
+        time.sleep(_CIPHER_CHAR_DELAY)
 
-        from terminaltexteffects.effects.effect_decrypt import Decrypt, DecryptConfig
-        from terminaltexteffects import Color, Gradient
+    time.sleep(_REVEAL_PAUSE)
 
-        # _build_config() correctly resolves ArgSpec defaults into real values.
-        # Direct instantiation leaves ArgSpec objects in the fields → TypeError.
-        cfg = DecryptConfig._build_config()
-        cfg.typing_speed          = 5
-        cfg.ciphertext_colors     = (Color("008000"), Color("00cb00"), Color("00ff00"))
-        cfg.final_gradient_stops  = (Color("00ff00"), Color("ffffff"))
-        cfg.final_gradient_steps  = 12
-        cfg.final_gradient_direction = Gradient.Direction.VERTICAL
+    # ── Phase 2: restore cursor, type plaintext with lock-in flash ───────────
+    sys.stdout.write(_CUR_RESTORE)
+    sys.stdout.flush()
 
-        # terminal_config=None → library calls TerminalConfig._build_config() internally
-        effect = Decrypt(text, effect_config=cfg)
-        with effect.terminal_output() as terminal:
-            for frame in effect:
-                terminal.print(frame)
+    per_char   = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
+    settle_dur = max(0.0, per_char - _FLASH_DUR)
 
-    except Exception:
-        # Any failure (missing package, terminal too small, etc.) — plain fallback
-        print(colorize(text, GREEN))
+    for ch in plaintext:
+        # Char appears bright-white ("locks in")
+        sys.stdout.write(BRIGHT_WHITE + ch + RESET)
+        sys.stdout.flush()
+        time.sleep(_FLASH_DUR)
+
+        # Step back one column and rewrite in normal colour (settles)
+        sys.stdout.write(_CUR_BACK1 + ch)
+        sys.stdout.flush()
+        time.sleep(settle_dur)
+
+    # Erase any residual cipher chars (guards emoji/wide-char edge cases)
+    sys.stdout.write(_ERASE_EOL + "\n")
+    sys.stdout.flush()
+
+
+def chat_decrypt_animation(
+    payload_bytes: bytes,
+    plaintext: str,
+    from_user: str,
+    msg_ts: str,
+    anim_enabled: bool = True,
+) -> None:
+    """Display an incoming group-chat message with the decrypt animation."""
+    ts_part   = cgrey(f"[{msg_ts}]")
+    user_part = colorize(from_user, GREEN, bold=True)
+    prefix    = f"{ts_part} {user_part}: "
+
+    if not anim_enabled or not sys.stdout.isatty():
+        print(prefix + plaintext)
+        return
+
+    with _ANIM_LOCK:
+        _run_animation(prefix, plaintext)
+
+
+def privmsg_decrypt_animation(
+    payload_bytes: bytes,
+    plaintext: str,
+    from_user: str,
+    msg_ts: str,
+    verified: bool = False,
+    anim_enabled: bool = True,
+) -> None:
+    """Display an incoming private message with the decrypt animation."""
+    ts_part  = cgrey(f"[{msg_ts}]")
+    src_part = colorize(f"[PM from {from_user}]", CYAN, bold=True)
+    sig_part = cok("✓") if verified else cwarn("?")
+    prefix   = f"{ts_part} {src_part}{sig_part} "
+
+    if not anim_enabled or not sys.stdout.isatty():
+        print(prefix + plaintext)
+        return
+
+    with _ANIM_LOCK:
+        _run_animation(prefix, plaintext)
 
 
 # ---------------------------------------------------------------------------

@@ -176,6 +176,9 @@ class NoEyesClient:
         # TOFU store
         self.tofu_store = id_mod.load_tofu(tofu_path)
 
+        # Animation flag — toggled by /anim on|off
+        self._anim_enabled: bool = True
+
         # DH state: username → {"priv": bytes, "pub": bytes}  (pending handshakes)
         self._dh_pending: dict[str, dict] = {}
         # Pairwise Fernet: username → Fernet  (established sessions)
@@ -255,7 +258,6 @@ class NoEyesClient:
 
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
-
 
             self._running = True
 
@@ -636,7 +638,12 @@ class NoEyesClient:
                     f"[SECURITY] Signature FAILED for message from {from_user} — displaying anyway."
                 ))
 
-            print(utils.format_privmsg(from_user, text, msg_ts, verified=verified))
+            # Animate text privmsgs: show encrypted payload → reveal plaintext
+            utils.privmsg_decrypt_animation(
+                payload, text, from_user, msg_ts,
+                verified=verified,
+                anim_enabled=self._anim_enabled,
+            )
 
     # ------------------------------------------------------------------
     # File transfer — receive side
@@ -894,6 +901,18 @@ class NoEyesClient:
             self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, new_room)
             return
 
+        if cmd == "/anim" and len(parts) >= 2:
+            if parts[1].lower() in ("on", "1", "yes"):
+                self._anim_enabled = True
+                print(utils.cok("[anim] Decrypt animation ON."))
+            elif parts[1].lower() in ("off", "0", "no"):
+                self._anim_enabled = False
+                print(utils.cinfo("[anim] Decrypt animation OFF."))
+            else:
+                state = "ON" if self._anim_enabled else "OFF"
+                print(utils.cinfo(f"[anim] Currently {state}. Use /anim on or /anim off."))
+            return
+
         if cmd == "/leave":
             # Leave current room and return to general
             if self.room == "general":
@@ -1056,5 +1075,6 @@ Commands:
   /leave               Leave current room and return to general.
   /msg <user> <text>   Encrypted private message (auto-DH on first use).
   /send <user> <file>  Send a file (encrypted, requires established DH).
+  /anim <on|off>       Toggle the decrypt animation for incoming messages.
 """
         print(utils.cinfo(help_text))
