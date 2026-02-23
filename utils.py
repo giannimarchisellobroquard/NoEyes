@@ -123,14 +123,12 @@ _CIPHER_POOL = list(
     "·×÷±∑∏∂∇∞∴≈≠≡≤≥"
 )
 
-# Purple/blue/teal shades — each cipher char picks one randomly
+# Cyan shades — matches the NoEyes logo colour
 _CIPHER_COLORS = [
-    "\033[35m",    # purple
-    "\033[1;35m",  # bright purple
-    "\033[95m",    # light magenta
-    "\033[34m",    # dark blue
-    "\033[1;34m",  # bright blue
-    "\033[36m",    # teal
+    "\033[36m",    # cyan
+    "\033[1;36m",  # bright cyan
+    "\033[96m",    # light cyan
+    "\033[1;96m",  # bold light cyan
 ]
 
 # ── Timing ──────────────────────────────────────────────────────────────────
@@ -159,15 +157,15 @@ def _run_animation(prefix: str, plaintext: str) -> None:
     """
     Core two-phase animation.  Called with _ANIM_LOCK already held.
 
-    prefix    — formatted '[ts] user: ' string (may contain ANSI codes)
-    plaintext — decrypted message text
+    Wrap-proof design
+    ─────────────────
+    Phase 1: print cipher chars.  We track EXACTLY how many terminal rows
+    they occupy using the live terminal width.  Any zoom level is fine.
 
-    Wrap-safe design
-    ────────────────
-    Phase 1 (cipher) is capped so it NEVER wraps past the terminal edge.
-    Phase 2 (reveal) uses \r + \033[2K to nuke the cipher line cleanly,
-    then retypes the prefix + plaintext — wrapping is fine here because
-    we are no longer trying to overwrite anything.
+    Phase 2: move the cursor back up to row 0 of the cipher block, go to
+    column 0, then \033[J (erase from cursor to end of screen) nukes every
+    cipher row in one shot — no matter how many lines wrapped.  Then we
+    retype prefix + plaintext from scratch.
     """
     n = len(plaintext)
     if n == 0:
@@ -175,16 +173,19 @@ def _run_animation(prefix: str, plaintext: str) -> None:
         sys.stdout.flush()
         return
 
-    # How many cipher chars can fit on the same line as the prefix?
     try:
         term_width = os.get_terminal_size().columns
     except OSError:
         term_width = 80
-    prefix_vis  = len(_strip_ansi(prefix))          # printable width of prefix
-    cipher_slots = max(4, term_width - prefix_vis - 1)   # at least 4 chars
-    cipher_n     = min(n, cipher_slots)              # never more than plaintext len
 
-    # ── Phase 1: cipher noise, guaranteed to stay on one line ────────────────
+    prefix_vis = len(_strip_ansi(prefix))
+
+    # Limit cipher chars to at most one full screen-width past the prefix
+    # so the cipher phase never runs on for more than 2 lines.
+    max_cipher = max(4, term_width - prefix_vis + term_width - 1)
+    cipher_n   = min(n, max_cipher)
+
+    # ── Phase 1: stream cipher noise ─────────────────────────────────────────
     sys.stdout.write(prefix)
     sys.stdout.flush()
 
@@ -197,22 +198,27 @@ def _run_animation(prefix: str, plaintext: str) -> None:
 
     time.sleep(_REVEAL_PAUSE)
 
-    # ── Phase 2: erase the whole line, retype prefix, reveal plaintext ───────
-    # \r  → go to column 0
-    # \033[2K → erase the entire current line (no leftover cipher chars)
-    # Then retype prefix so columns line up exactly as before.
-    sys.stdout.write("\r\033[2K" + prefix)
+    # ── Phase 2: erase ALL cipher rows, retype, reveal plaintext ─────────────
+    # Calculate how many terminal rows the cipher block occupies.
+    cipher_total_cols = prefix_vis + cipher_n
+    rows_used = max(1, (cipher_total_cols + term_width - 1) // term_width)
+
+    # Move cursor back up to the first row of the cipher block.
+    if rows_used > 1:
+        sys.stdout.write(f"\033[{rows_used - 1}A")  # move up N-1 rows
+
+    # \r → column 0, \033[J → erase from cursor to end of screen (all rows)
+    sys.stdout.write("\r\033[J" + prefix)
     sys.stdout.flush()
 
+    # Type plaintext with lock-in flash on each char
     per_char   = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
     settle_dur = max(0.0, per_char - _FLASH_DUR)
 
     for ch in plaintext:
-        # Flash bright-white (lock-in feel)
         sys.stdout.write(BRIGHT_WHITE + ch + RESET)
         sys.stdout.flush()
         time.sleep(_FLASH_DUR)
-        # Step back one column, rewrite in normal colour (settles)
         sys.stdout.write(_CUR_BACK1 + ch)
         sys.stdout.flush()
         time.sleep(settle_dur)
