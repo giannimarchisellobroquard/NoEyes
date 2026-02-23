@@ -1,4 +1,3 @@
-# FILE: README.md
 # NoEyes – Secure Terminal Chat
 
 NoEyes is a terminal‑based secure chat tool that allows two or more users to
