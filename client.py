@@ -587,7 +587,10 @@ class NoEyesClient:
                 "Wrong key?"
             ))
             return
-        print(utils.format_message(from_user, text, msg_ts))
+        utils.chat_decrypt_animation(
+            payload, text, from_user, msg_ts,
+            anim_enabled=self._anim_enabled,
+        )
 
     def _flush_privmsg_buffer(self, from_user: str) -> None:
         """Replay any buffered incoming privmsgs from *from_user* now that the key is ready."""

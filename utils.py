@@ -26,9 +26,17 @@ PURPLE       = "\033[35m"
 BRIGHT_WHITE = "\033[1;37m"
 
 
+def _is_tty() -> bool:
+    """True if we are attached to a real terminal (robust check)."""
+    try:
+        return os.isatty(sys.stdout.fileno())
+    except Exception:
+        return False
+
+
 def colorize(text: str, color: str, bold: bool = False) -> str:
     """Wrap *text* with ANSI escape codes if stdout is a TTY."""
-    if not sys.stdout.isatty():
+    if not _is_tty():
         return text
     prefix = BOLD if bold else ""
     return f"{prefix}{color}{text}{RESET}"
@@ -205,7 +213,7 @@ def chat_decrypt_animation(
     user_part = colorize(from_user, GREEN, bold=True)
     prefix    = f"{ts_part} {user_part}: "
 
-    if not anim_enabled or not sys.stdout.isatty():
+    if not anim_enabled or not _is_tty():
         print(prefix + plaintext)
         return
 
@@ -227,7 +235,7 @@ def privmsg_decrypt_animation(
     sig_part = cok("✓") if verified else cwarn("?")
     prefix   = f"{ts_part} {src_part}{sig_part} "
 
-    if not anim_enabled or not sys.stdout.isatty():
+    if not anim_enabled or not _is_tty():
         print(prefix + plaintext)
         return
 
