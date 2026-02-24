@@ -262,6 +262,23 @@ def privmsg_decrypt_animation(
 # ---------------------------------------------------------------------------
 
 
+def erase_input(raw: str) -> None:
+    """Erase the raw typed input line(s) from the terminal.
+    Uses move-up + erase-to-end so wrapped long inputs are fully cleared.
+    """
+    if not _is_tty():
+        return
+    try:
+        tw = os.get_terminal_size().columns
+    except OSError:
+        tw = 80
+    wrap_lines = len(raw) // tw
+    if wrap_lines:
+        sys.stdout.write("\033[" + str(wrap_lines) + "A")  # move up
+    sys.stdout.write("\r\033[J")  # col 0, erase to end of screen
+    sys.stdout.flush()
+
+
 def format_message(username: str, text: str, timestamp: str) -> str:
     """Format a chat line for display (incoming — other users)."""
     ts  = cgrey(f"[{timestamp}]")

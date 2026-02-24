@@ -543,8 +543,6 @@ class NoEyesClient:
         }
         self._send(header, payload)
         ts = time.strftime("%H:%M:%S")
-        sys.stdout.write("\r\033[2K")
-        sys.stdout.flush()
         print(utils.format_own_message(self.username, text, ts))
 
     def _send_privmsg_encrypted(self, peer: str, text: str) -> None:
@@ -572,8 +570,6 @@ class NoEyesClient:
             "from": self.username,
         }
         self._send( header, payload)
-        sys.stdout.write("\r\033[2K")
-        sys.stdout.flush()
         print(utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
 
     def _handle_chat(self, header: dict, payload: bytes, ts: str) -> None:
