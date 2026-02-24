@@ -264,43 +264,7 @@ python selftest.py
 
 ## Demo
 
-![NoEyes terminal demo](demo.svg)
-
-## Screenshots / Record Your Own
-
-**To record a demo with asciinema (free, takes 2 minutes):**
-
-```bash
-pip install asciinema
-asciinema rec demo.cast    # records your terminal — Ctrl+D to stop
-asciinema upload demo.cast # gives you a link
-```
-
-Then embed in this README:
-```markdown
-[![asciicast](https://asciinema.org/a/YOUR_ID.svg)](https://asciinema.org/a/YOUR_ID)
-```
-
-**Suggested demo script (~90 seconds):**
-
-Open 3 terminals side by side:
-
-```bash
-# Terminal 1 — server (notice it prints NO message content)
-python noeyes.py --server --port 5000
-
-# Terminal 2 — alice
-python noeyes.py --connect 127.0.0.1 --port 5000 --username alice --key-file ./chat.key
-# type: hello bob
-# type: /join secret
-# type: this is only visible in secret room
-# type: /leave
-
-# Terminal 3 — bob
-python noeyes.py --connect 127.0.0.1 --port 5000 --username bob --key-file ./chat.key
-# type: /msg alice hey          (auto-triggers DH handshake)
-# type: /send alice ./somefile  (encrypted file transfer)
-```
+[![asciicast](https://asciinema.org/a/jEKQCJ8yNV0FU0gM.svg)](https://asciinema.org/a/jEKQCJ8yNV0FU0gM)
 
 ---
 
