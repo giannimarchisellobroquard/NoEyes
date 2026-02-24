@@ -108,7 +108,7 @@ def _erase_input_unsafe() -> None:
         return
     tw = _get_tw()
     n  = len(_g_buf)
-    lines_up = (n - 1) // tw   # number of extra rows above the last row
+    lines_up = n // tw          # floor: cursor is on row n//tw after typing n chars from col 0
     if lines_up:
         sys.stdout.write("\033[" + str(lines_up) + "A")
     sys.stdout.write("\r\033[J")
