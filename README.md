@@ -123,9 +123,9 @@ If the server is on a home machine behind a router:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Alice ──────────────────────────────────────── Bob         │
-│    │          Encrypted payload (opaque)          │         │
-│    │                    │                         │         │
-│    └──────────► SERVER ─┴◄───────────────────────┘         │
+│    │          Encrypted payload (opaque)         │          │
+│    │                    │                        │          │
+│    └──────────► SERVER ─┴◄───────────────────────┘          │
 │                    │                                        │
 │              Blind forwarder:                               │
 │              reads header only                              │
