@@ -387,7 +387,7 @@ class NoEyesServer:
                 room = header.get("room", conn.room)
                 if room != conn.room:
                     room = conn.room   # cannot broadcast to other rooms
-                await self._broadcast_room(room, header, payload, record=True)
+                await self._broadcast_room(room, header, payload, record=True, exclude=conn.username)
             return
 
         # Client-initiated leave
@@ -526,8 +526,9 @@ class NoEyesServer:
             "ts":       _now_ts(),
         }, b"", exclude=conn.username)
 
-        # Replay history to the joining client
-        for h, p in list(self._history[new_room]):
+        # Replay history so client sees messages sent while they were away.
+        history = list(self._history[new_room])
+        for h, p in history:
             await conn.send(h, p)
 
     # ------------------------------------------------------------------

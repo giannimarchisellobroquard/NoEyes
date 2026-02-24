@@ -9,6 +9,7 @@ import time
 import random
 import re
 import threading
+from collections import defaultdict
 
 # ---------------------------------------------------------------------------
 # ANSI color helpers
@@ -75,24 +76,23 @@ def print_banner() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Global input state
+# Global state — output lock + per-room message log + input buffer
 #
-# read_line_noecho() writes every typed char into _g_buf and sets
-# _g_input_active = True.  Any thread that wants to print something calls
-# print_msg() which:
-#   1. acquires _OUTPUT_LOCK
-#   2. erases the current partial input (if any) from the screen
-#   3. prints the message
-#   4. redraws the partial input so the user can keep typing
-#   5. releases _OUTPUT_LOCK
+# ALL terminal output goes through print_msg() which holds _OUTPUT_LOCK.
+# read_line_noecho() shares _g_buf with print_msg() so incoming messages
+# can erase the partial input, print, then redraw it seamlessly.
 #
-# This means incoming messages, animations, status lines — everything —
-# always land cleanly above the input line regardless of race conditions.
+# Per-room log: every displayed message is stored in _room_logs[room].
+# switch_room_display() clears the screen and reprints that room's log —
+# no server history replay needed for room switches.
 # ---------------------------------------------------------------------------
 
-_OUTPUT_LOCK    = threading.Lock()   # serialises ALL terminal writes
-_g_buf          : list  = []         # chars typed so far (shared with input thread)
-_g_input_active : bool  = False      # True while noecho loop is running
+_OUTPUT_LOCK    = threading.Lock()
+_g_buf          : list = []
+_g_input_active : bool = False
+_room_logs      : dict = defaultdict(list)   # room -> [rendered_string, ...]
+_room_seen      : dict = defaultdict(set)    # room -> set of "ts|user|text" keys already animated
+_current_room   : list = ["general"]         # mutable single-element so closures can mutate it
 
 
 def _get_tw() -> int:
@@ -103,20 +103,20 @@ def _get_tw() -> int:
 
 
 def _erase_input_unsafe() -> None:
-    """Erase the current partial input from the screen (no lock — caller holds it)."""
+    """Erase partial input from screen. Caller must hold _OUTPUT_LOCK."""
     if not _g_input_active or not _g_buf:
         return
-    tw = _get_tw()
-    n  = len(_g_buf)
-    lines_up = n // tw          # floor: cursor is on row n//tw after typing n chars from col 0
-    if lines_up:
-        sys.stdout.write("\033[" + str(lines_up) + "A")
+    tw       = _get_tw()
+    n        = len(_g_buf)
+    rows_up  = n // tw          # floor: after n chars from col 0, cursor is on row n//tw
+    if rows_up:
+        sys.stdout.write("\033[" + str(rows_up) + "A")
     sys.stdout.write("\r\033[J")
     sys.stdout.flush()
 
 
 def _redraw_input_unsafe() -> None:
-    """Redraw the partial input after a message was printed (no lock — caller holds it)."""
+    """Redraw partial input. Caller must hold _OUTPUT_LOCK."""
     if not _g_input_active or not _g_buf:
         return
     sys.stdout.write("".join(_g_buf))
@@ -124,10 +124,7 @@ def _redraw_input_unsafe() -> None:
 
 
 def print_msg(text: str) -> None:
-    """
-    Print a line of output, cleanly interleaving with any in-progress input.
-    ALL output in the client must go through this function (or print_msg_raw).
-    """
+    """Print a line of output, cleanly interleaving with in-progress input."""
     if not _is_tty():
         print(text)
         return
@@ -135,6 +132,52 @@ def print_msg(text: str) -> None:
         _erase_input_unsafe()
         print(text)
         _redraw_input_unsafe()
+
+
+def log_and_print(room: str, text: str) -> None:
+    """Store message in room log and print it (no animation)."""
+    _room_logs[room].append(text)
+    print_msg(text)
+
+
+def _msg_key(from_user: str, ts: str, text: str) -> str:
+    return f"{ts}|{from_user}|{text[:40]}"
+
+
+def already_seen(room: str, from_user: str, ts: str, text: str) -> bool:
+    """Return True if this message has already been animated for this room."""
+    return _msg_key(from_user, ts, text) in _room_seen[room]
+
+
+def mark_seen(room: str, from_user: str, ts: str, text: str) -> None:
+    """Mark a message as having been animated."""
+    _room_seen[room].add(_msg_key(from_user, ts, text))
+
+
+def switch_room_display(room_name: str, show_banner: bool = False) -> None:
+    """
+    Clear the terminal and show the room header.
+    The server will replay history (with animation) right after this call,
+    so we just clear the screen — no local log reprint needed.
+    Holds _OUTPUT_LOCK throughout so nothing prints between clear and header.
+    """
+    _current_room[0] = room_name
+    _room_logs[room_name].clear()   # server replay will refill it
+    with _OUTPUT_LOCK:
+        _erase_input_unsafe()
+        if _is_tty():
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+        if show_banner:
+            print(colorize(BANNER, CYAN, bold=True))
+        print(colorize(f"  ══  {room_name}  ══", CYAN, bold=True))
+        print()
+        _redraw_input_unsafe()
+
+
+# Alias used in older call sites
+def clear_for_room(room_name: str, show_banner: bool = False) -> None:
+    switch_room_display(room_name, show_banner=show_banner)
 
 
 # ---------------------------------------------------------------------------
@@ -150,10 +193,10 @@ _CIPHER_POOL = list(
 )
 
 _CIPHER_COLORS = [
-    "\033[36m",    # cyan
-    "\033[1;36m",  # bright cyan
-    "\033[96m",    # light cyan
-    "\033[1;96m",  # bold light cyan
+    "\033[36m",
+    "\033[1;36m",
+    "\033[96m",
+    "\033[1;96m",
 ]
 
 _CIPHER_CHAR_DELAY = 0.022
@@ -167,10 +210,7 @@ def _strip_ansi(s: str) -> str:
 
 
 def _run_animation(prefix: str, plaintext: str) -> None:
-    """
-    Wave-decrypt animation. Called while _OUTPUT_LOCK is held.
-    Input line is already erased; we redraw it at the end.
-    """
+    """Wave-decrypt animation. Called while _OUTPUT_LOCK is held and input is erased."""
     WAVE = 6
     n    = len(plaintext)
     if n == 0:
@@ -181,7 +221,6 @@ def _run_animation(prefix: str, plaintext: str) -> None:
     tw         = _get_tw()
     prefix_vis = len(_strip_ansi(prefix))
 
-    # ── Phase 1: wave stream ──────────────────────────────────────────────
     sys.stdout.write(prefix)
     sys.stdout.flush()
 
@@ -204,12 +243,23 @@ def _run_animation(prefix: str, plaintext: str) -> None:
 
     time.sleep(_REVEAL_PAUSE * 0.4)
 
-    # ── Phase 2: cleanup ──────────────────────────────────────────────────
     lines_up = (prefix_vis + n) // tw
     if lines_up:
         sys.stdout.write("\033[" + str(lines_up) + "A")
     sys.stdout.write("\r" + prefix + plaintext + "\n")
     sys.stdout.flush()
+
+
+def _animate_msg(prefix: str, plaintext: str, room: str,
+                  from_user: str = "", ts: str = "") -> None:
+    """Run animation inside the output lock, log the final text, mark seen."""
+    _room_logs[room].append(prefix + plaintext)
+    if from_user and ts:
+        mark_seen(room, from_user, ts, plaintext)
+    with _OUTPUT_LOCK:
+        _erase_input_unsafe()
+        _run_animation(prefix, plaintext)
+        _redraw_input_unsafe()
 
 
 def chat_decrypt_animation(
@@ -218,19 +268,26 @@ def chat_decrypt_animation(
     from_user: str,
     msg_ts: str,
     anim_enabled: bool = True,
+    room: str = "general",
 ) -> None:
     ts_part   = cgrey(f"[{msg_ts}]")
     user_part = colorize(from_user, GREEN, bold=True)
     prefix    = f"{ts_part} {user_part}: "
+    rendered  = prefix + plaintext
 
-    if not anim_enabled or not _is_tty():
-        print_msg(prefix + plaintext)
+    # Already seen — reprint plain (no animation) so it shows in the room
+    # after a screen clear / room switch.
+    if already_seen(room, from_user, msg_ts, plaintext):
+        _room_logs[room].append(rendered)
+        print_msg(rendered)
         return
 
-    with _OUTPUT_LOCK:
-        _erase_input_unsafe()
-        _run_animation(prefix, plaintext)
-        _redraw_input_unsafe()
+    if not anim_enabled or not _is_tty():
+        log_and_print(room, rendered)
+        mark_seen(room, from_user, msg_ts, plaintext)
+        return
+
+    _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts)
 
 
 def privmsg_decrypt_animation(
@@ -240,20 +297,24 @@ def privmsg_decrypt_animation(
     msg_ts: str,
     verified: bool = False,
     anim_enabled: bool = True,
+    room: str = "general",
 ) -> None:
     ts_part  = cgrey(f"[{msg_ts}]")
     src_part = colorize(f"[PM from {from_user}]", CYAN, bold=True)
     sig_part = cok("✓") if verified else cwarn("?")
     prefix   = f"{ts_part} {src_part}{sig_part} "
+    rendered = prefix + plaintext
 
-    if not anim_enabled or not _is_tty():
-        print_msg(prefix + plaintext)
+    if already_seen(room, from_user, msg_ts, plaintext):
+        print_msg(rendered)   # replay — don't re-log, already in _room_logs
         return
 
-    with _OUTPUT_LOCK:
-        _erase_input_unsafe()
-        _run_animation(prefix, plaintext)
-        _redraw_input_unsafe()
+    if not anim_enabled or not _is_tty():
+        log_and_print(room, rendered)
+        mark_seen(room, from_user, msg_ts, plaintext)
+        return
+
+    _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +323,17 @@ def privmsg_decrypt_animation(
 
 def read_line_noecho() -> str:
     """
-    Read a line from stdin with manual echo.  Characters are written into
-    _g_buf so that any concurrent print_msg() call can erase/redraw them.
-    On Enter: erase the input line(s) cleanly, return the string.
+    Read a line with manual echo. Characters go into _g_buf so print_msg()
+    can erase/redraw them around incoming messages.
     Falls back to plain input() when stdin is not a TTY.
     """
     global _g_input_active, _g_buf
 
     if not sys.stdin.isatty():
-        return input()
+        line = sys.stdin.readline()
+        if line == "":          # real EOF
+            raise EOFError
+        return line.rstrip("\n")
 
     import termios, tty
 
@@ -307,19 +370,19 @@ def read_line_noecho() -> str:
                     _g_buf          = []
                 raise EOFError
 
-            elif ch in ("\x7f", "\x08"):  # Backspace
+            elif ch in ("\x7f", "\x08"):
                 with _OUTPUT_LOCK:
                     if _g_buf:
                         _g_buf.pop()
                         sys.stdout.write("\b \b")
                         sys.stdout.flush()
 
-            elif ch == "\x1b":             # Escape / arrow keys — swallow
+            elif ch == "\x1b":
                 nxt = sys.stdin.read(1)
                 if nxt == "[":
                     sys.stdin.read(1)
 
-            elif ch >= " ":                 # Printable char
+            elif ch >= " ":
                 with _OUTPUT_LOCK:
                     _g_buf.append(ch)
                     sys.stdout.write(ch)
@@ -334,9 +397,8 @@ def read_line_noecho() -> str:
     return result
 
 
-
 # ---------------------------------------------------------------------------
-# Misc helpers
+# Format helpers
 # ---------------------------------------------------------------------------
 
 def format_message(username: str, text: str, timestamp: str) -> str:

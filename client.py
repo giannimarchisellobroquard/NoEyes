@@ -219,9 +219,6 @@ class NoEyesClient:
 
     def run(self) -> None:
         """Main entry point: connect, join, and start I/O threads."""
-        utils.clear_screen()
-        utils.print_banner()
-
         # Pre-create all receive folders so they exist on every platform
         # (including Android/Termux) before any transfer happens.
         for subfolder in ("images", "videos", "audio", "docs", "other"):
@@ -259,6 +256,7 @@ class NoEyesClient:
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
 
+            utils.switch_room_display(self.room, show_banner=True)
             self._running = True
 
             self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
@@ -530,10 +528,11 @@ class NoEyesClient:
 
     def _send_chat(self, text: str) -> None:
         """Encrypt and broadcast a group chat message."""
+        ts   = time.strftime("%H:%M:%S")   # single capture — used in body AND mark_seen
         body = json.dumps({
             "text":     text,
             "username": self.username,
-            "ts":       time.strftime("%H:%M:%S"),
+            "ts":       ts,
         }).encode()
         payload = self._room_fernet.encrypt(body)
         header = {
@@ -542,8 +541,8 @@ class NoEyesClient:
             "from": self.username,
         }
         self._send(header, payload)
-        ts = time.strftime("%H:%M:%S")
-        utils.print_msg(utils.format_own_message(self.username, text, ts))
+        utils.log_and_print(self.room, utils.format_own_message(self.username, text, ts))
+        utils.mark_seen(self.room, self.username, ts, text)
 
     def _send_privmsg_encrypted(self, peer: str, text: str) -> None:
         """Send a /msg to *peer* using the established pairwise Fernet."""
@@ -570,13 +569,11 @@ class NoEyesClient:
             "from": self.username,
         }
         self._send( header, payload)
-        utils.print_msg(utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
+        utils.log_and_print(self.room, utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
 
     def _handle_chat(self, header: dict, payload: bytes, ts: str) -> None:
         """Decrypt and display a group chat message."""
         from_user = header.get("from", "?")
-        if from_user == self.username:
-            return  # server echoes back to all; skip own messages if server sends to all
         try:
             body = json.loads(self._room_fernet.decrypt(payload))
             text = body.get("text", "")
@@ -590,6 +587,7 @@ class NoEyesClient:
         utils.chat_decrypt_animation(
             payload, text, from_user, msg_ts,
             anim_enabled=self._anim_enabled,
+            room=self.room,
         )
 
     def _flush_privmsg_buffer(self, from_user: str) -> None:
@@ -646,6 +644,7 @@ class NoEyesClient:
                 payload, text, from_user, msg_ts,
                 verified=verified,
                 anim_enabled=self._anim_enabled,
+                room=self.room,
             )
 
     # ------------------------------------------------------------------
@@ -795,23 +794,23 @@ class NoEyesClient:
         event = header.get("event", "")
         if event == "join":
             uname = header.get("username", "?")
-            utils.print_msg(utils.format_system(f"{uname} has joined the chat.", ts))
+            utils.log_and_print(self.room, utils.format_system(f"{uname} has joined the chat.", ts))
         elif event == "leave":
             uname  = header.get("username", "?")
             reason = header.get("reason", "disconnect")
             if reason == "room_change":
-                utils.print_msg(utils.format_system(f"{uname} switched rooms.", ts))
+                utils.log_and_print(self.room, utils.format_system(f"{uname} switched rooms.", ts))
                 # Pairwise key is preserved — they're still online, just in another room.
                 # /msg and /send will still work across rooms.
             else:
-                utils.print_msg(utils.format_system(f"{uname} has left the chat.", ts))
+                utils.log_and_print(self.room, utils.format_system(f"{uname} has left the chat.", ts))
                 # Real disconnect — clear pairwise state so stale keys don't accumulate.
                 self._pairwise.pop(uname, None)
                 self._dh_pending.pop(uname, None)
         elif event == "nick":
             old = header.get("old_nick", "?")
             new = header.get("new_nick", "?")
-            utils.print_msg(utils.format_system(f"{old} is now known as {new}.", ts))
+            utils.log_and_print(self.room, utils.format_system(f"{old} is now known as {new}.", ts))
             # Move ALL pairwise state to new nick — including in-flight handshakes.
             # Without migrating _dh_pending, a dh_resp from the renamed user
             # arrives with the new name but is silently dropped (not found in pending).
@@ -880,8 +879,7 @@ class NoEyesClient:
             return
 
         if cmd == "/clear":
-            utils.clear_screen()
-            utils.print_banner()
+            utils.switch_room_display(self.room, show_banner=True)
             return
 
         if cmd == "/users":
@@ -898,10 +896,10 @@ class NoEyesClient:
 
         if cmd == "/join" and len(parts) >= 2:
             new_room = parts[1]
-            self._send({"type": "command", "event": "join_room", "room": new_room})
-            self.room = new_room
-            utils.print_msg(utils.cinfo(f"[join] Switched to room '{new_room}'."))
             self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, new_room)
+            self.room = new_room
+            utils.switch_room_display(new_room)
+            self._send({"type": "command", "event": "join_room", "room": new_room})
             return
 
         if cmd == "/anim" and len(parts) >= 2:
@@ -921,10 +919,10 @@ class NoEyesClient:
             if self.room == "general":
                 utils.print_msg(utils.cinfo("[leave] You are already in 'general'."))
             else:
-                self._send({"type": "command", "event": "join_room", "room": "general"})
-                self.room = "general"
-                utils.print_msg(utils.cinfo("[leave] Returned to room 'general'."))
                 self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, "general")
+                self.room = "general"
+                utils.switch_room_display("general")
+                self._send({"type": "command", "event": "join_room", "room": "general"})
             return
 
         if cmd == "/msg" and len(parts) >= 3:
