@@ -94,6 +94,22 @@ _room_logs      : dict = defaultdict(list)   # room -> [rendered_string, ...]
 _room_seen      : dict = defaultdict(set)    # room -> set of "ts|user|text" keys already animated
 _current_room   : list = ["general"]         # mutable single-element so closures can mutate it
 
+# Animation skip — set by Escape hotkey; auto-clears after 2 s so future messages still animate.
+_SKIP_ANIM : threading.Event = threading.Event()
+
+def trigger_skip_animation() -> None:
+    """
+    Called when user presses Escape.
+    Skips all ongoing/queued animations instantly.
+    Auto-resets after 2 s so future incoming messages still animate.
+    """
+    _SKIP_ANIM.set()
+    def _auto_clear():
+        time.sleep(2.0)
+        _SKIP_ANIM.clear()
+    threading.Thread(target=_auto_clear, daemon=True).start()
+
+
 
 def _get_tw() -> int:
     try:
@@ -210,7 +226,18 @@ def _strip_ansi(s: str) -> str:
 
 
 def _run_animation(prefix: str, plaintext: str) -> None:
-    """Wave-decrypt animation. Called while _OUTPUT_LOCK is held and input is erased."""
+    """
+    Wave animation using DECSC/DECRC (\0337/\0338) save-restore cursor.
+
+    At every step we restore to the saved position and rewrite the full
+    current wave state — no cursor arithmetic, no line-wrap maths, works
+    at any terminal width.
+
+    Wave state at step i:
+      plaintext[0 .. i-WAVE]     already revealed (plaintext chars)
+      cipher x WAVE              the moving cipher window
+    End-of-wave drain reveals the last WAVE chars one by one.
+    """
     WAVE = 6
     n    = len(plaintext)
     if n == 0:
@@ -218,35 +245,46 @@ def _run_animation(prefix: str, plaintext: str) -> None:
         sys.stdout.flush()
         return
 
-    tw         = _get_tw()
-    prefix_vis = len(_strip_ansi(prefix))
+    # ── fast path ─────────────────────────────────────────────────────────────
+    if _SKIP_ANIM.is_set():
+        sys.stdout.write(prefix + plaintext + RESET + "\n")
+        sys.stdout.flush()
+        return
 
-    sys.stdout.write(prefix)
+    # Save cursor position — we restore here at every frame
+    sys.stdout.write("\0337")
     sys.stdout.flush()
 
-    for i in range(n):
-        sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
+    def _write_state(revealed: int, wave_end: int) -> None:
+        """Restore to saved pos, write prefix + plaintext[:revealed] + cipher window."""
+        sys.stdout.write("\0338" + RESET + prefix)
+        if revealed > 0:
+            sys.stdout.write(plaintext[:revealed])
+        for _ in range(wave_end - revealed):
+            sys.stdout.write(
+                random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET
+            )
         sys.stdout.flush()
 
-        reveal_i = i - WAVE
-        if reveal_i >= 0:
-            cursor_col = (prefix_vis + i + 1) % tw
-            if cursor_col >= WAVE + 1:
-                sys.stdout.write(
-                    "\033[" + str(WAVE + 1) + "D"
-                    + plaintext[reveal_i]
-                    + "\033[" + str(WAVE) + "C"
-                )
-                sys.stdout.flush()
-
+    # ── main wave ─────────────────────────────────────────────────────────────
+    for i in range(n):
+        if _SKIP_ANIM.is_set():
+            break
+        # revealed = chars before the WAVE window
+        revealed = max(0, i + 1 - WAVE)
+        _write_state(revealed, i + 1)
         time.sleep(_CIPHER_CHAR_DELAY)
 
-    time.sleep(_REVEAL_PAUSE * 0.4)
+    # ── end-of-wave drain: reveal last WAVE chars one by one ─────────────────
+    end_delay = min(_PLAIN_CHAR_MAX, _REVEAL_PAUSE / max(WAVE, 1))
+    for k in range(max(0, n - WAVE), n):
+        if _SKIP_ANIM.is_set():
+            break
+        _write_state(k + 1, n)
+        time.sleep(end_delay)
 
-    lines_up = (prefix_vis + n) // tw
-    if lines_up:
-        sys.stdout.write("\033[" + str(lines_up) + "A")
-    sys.stdout.write("\r" + prefix + plaintext + "\n")
+    # ── final clean overwrite ─────────────────────────────────────────────────
+    sys.stdout.write("\0338" + RESET + prefix + plaintext + RESET + "\n")
     sys.stdout.flush()
 
 
@@ -269,9 +307,13 @@ def chat_decrypt_animation(
     msg_ts: str,
     anim_enabled: bool = True,
     room: str = "general",
+    own_username: str = "",
 ) -> None:
     ts_part   = cgrey(f"[{msg_ts}]")
-    user_part = colorize(from_user, GREEN, bold=True)
+    # Own messages use YELLOW (matching what was displayed at send time).
+    # Other users use GREEN.
+    color     = YELLOW if (own_username and from_user == own_username) else GREEN
+    user_part = colorize(from_user, color, bold=True)
     prefix    = f"{ts_part} {user_part}: "
     rendered  = prefix + plaintext
 
@@ -378,9 +420,17 @@ def read_line_noecho() -> str:
                         sys.stdout.flush()
 
             elif ch == "\x1b":
-                nxt = sys.stdin.read(1)
-                if nxt == "[":
-                    sys.stdin.read(1)
+                # Peek with 50 ms timeout to tell lone ESC from escape sequences
+                import select as _sel
+                r, _, _ = _sel.select([sys.stdin], [], [], 0.20)
+                if r:
+                    nxt = sys.stdin.read(1)
+                    if nxt == "[":
+                        sys.stdin.read(1)   # consume arrow/function key byte
+                    # else: other escape sequence — discard nxt, do nothing
+                else:
+                    # Lone Escape — skip all ongoing animations
+                    trigger_skip_animation()
 
             elif ch >= " ":
                 with _OUTPUT_LOCK:

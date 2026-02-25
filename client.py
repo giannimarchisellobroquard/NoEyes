@@ -185,6 +185,9 @@ class NoEyesClient:
         self._pairwise: dict[str, Fernet] = {}
         # Queue of outgoing /msg text waiting for DH to complete (sender side)
         self._msg_queue: dict[str, list] = {}
+        # Queued outgoing file sends waiting for DH to complete
+        self._file_queue: dict[str, list] = {}  # peer -> [(filepath, ...),]
+
         # Buffer of incoming privmsg frames that arrived before pairwise key was ready
         self._privmsg_buffer: dict[str, list] = {}
         # In-progress incoming file transfers: transfer_id → {meta, chunks}
@@ -493,6 +496,10 @@ class NoEyesClient:
         for text in self._msg_queue.pop(from_user, []):
             self._send_privmsg_encrypted(from_user, text)
 
+        # Flush queued file sends
+        for filepath in self._file_queue.pop(from_user, []):
+            self._send_file(from_user, filepath)
+
         # Replay any incoming privmsgs that arrived before the key was ready
         self._flush_privmsg_buffer(from_user)
 
@@ -518,6 +525,10 @@ class NoEyesClient:
         # Flush any queued outgoing messages
         for text in self._msg_queue.pop(from_user, []):
             self._send_privmsg_encrypted(from_user, text)
+
+        # Flush queued file sends
+        for filepath in self._file_queue.pop(from_user, []):
+            self._send_file(from_user, filepath)
 
         # Replay any incoming privmsgs that arrived before the key was ready
         self._flush_privmsg_buffer(from_user)
@@ -588,6 +599,7 @@ class NoEyesClient:
             payload, text, from_user, msg_ts,
             anim_enabled=self._anim_enabled,
             room=self.room,
+            own_username=self.username,
         )
 
     def _flush_privmsg_buffer(self, from_user: str) -> None:
@@ -807,6 +819,8 @@ class NoEyesClient:
                 # Real disconnect — clear pairwise state so stale keys don't accumulate.
                 self._pairwise.pop(uname, None)
                 self._dh_pending.pop(uname, None)
+                self._file_queue.pop(uname, None)
+                self._msg_queue.pop(uname, None)
         elif event == "nick":
             old = header.get("old_nick", "?")
             new = header.get("new_nick", "?")
@@ -820,6 +834,8 @@ class NoEyesClient:
                 self._dh_pending[new] = self._dh_pending.pop(old)
             if old in self._msg_queue:
                 self._msg_queue[new] = self._msg_queue.pop(old)
+            if old in self._file_queue:
+                self._file_queue[new] = self._file_queue.pop(old)
         elif event == "rate_limit":
             utils.print_msg(utils.cwarn("[warn] You are sending messages too fast."))
         elif event == "nick_error":
@@ -964,7 +980,10 @@ class NoEyesClient:
             return
         pairwise = self._pairwise.get(peer)
         if pairwise is None:
-            utils.print_msg(utils.cwarn(f"[send] No pairwise key with {peer} — /msg them first."))
+            # No key yet — queue the send and initiate DH (same pattern as /msg)
+            utils.print_msg(utils.cgrey(f"[send] No key with {peer} yet — establishing DH, will send after…"))
+            self._file_queue.setdefault(peer, []).append(str(path))
+            self._ensure_dh(peer)
             return
 
         import uuid, hashlib as _hl, queue as _q, time as _t
