@@ -296,7 +296,7 @@ class NoEyesServer:
                 ssl_ctx.load_cert_chain(self.ssl_cert, self.ssl_key)
                 print(f"[server] TLS enabled — cert: {self.ssl_cert}")
             except Exception as e:
-                print(f"[server] TLS setup failed: {e} — falling back to plaintext")
+                print(f"[server] TLS setup failed: {e} — falling back (messages remain E2E encrypted regardless)")
                 ssl_ctx = None
         elif self.ssl_cert or self.ssl_key:
             print("[server] WARNING: --tls requires both --cert and --tls-key; "
@@ -311,7 +311,7 @@ class NoEyesServer:
         )
         async with server:
             addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-            proto = "TLS" if ssl_ctx else "plaintext"
+            proto = "TLS" if ssl_ctx else "transport unencrypted — messages are E2E encrypted regardless"
             print(f"[server] Listening on {addrs} ({proto})")
             logger.info("NoEyes server listening on %s (%s)", addrs, proto)
             # Start heartbeat as a background task

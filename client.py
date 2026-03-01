@@ -205,6 +205,11 @@ class NoEyesClient:
         # Users whose pubkey didn't match our TOFU store (possible key regen or attack)
         # Messages from these users are shown with a ⚠ marker, not silently dropped.
         self._tofu_mismatched: set = set()
+        # Users we have already shown the SECURITY WARNING for this session.
+        # The server sends pubkey_announce twice per join (send_known_pubkeys +
+        # the client's own _announce_pubkey) so without this guard the warning
+        # fires twice for the same event.
+        self._tofu_warned: set = set()
 
         # Buffer of incoming privmsg frames that arrived before pairwise key was ready
         self._privmsg_buffer: dict[str, list] = {}
@@ -412,15 +417,17 @@ class NoEyesClient:
             utils.print_msg(utils.cok(f"[tofu] Trusted new key for {uname} (first contact)."))
         elif not trusted:
             self._tofu_mismatched.add(uname)
-            utils.print_msg(utils.cerr(
-                f"[SECURITY WARNING] Key mismatch for {uname}!\n"
-                f"  Stored key : {self.tofu_store.get(uname, '(none)')[:24]}...\n"
-                f"  New key    : {vk_hex[:24]}...\n"
-                "  Their identity may have changed (e.g. they reinstalled NoEyes),\n"
-                "  or this could be an impersonation attempt.\n"
-                "  Messages from this user will be shown with a ⚠ marker.\n"
-                f"  If you trust them, type:  /trust {uname}"
-            ))
+            if uname not in self._tofu_warned:
+                self._tofu_warned.add(uname)
+                utils.print_msg(utils.cerr(
+                    f"[SECURITY WARNING] Key mismatch for {uname}!\n"
+                    f"  Stored key : {self.tofu_store.get(uname, '(none)')[:24]}...\n"
+                    f"  New key    : {vk_hex[:24]}...\n"
+                    "  Their identity may have changed (e.g. they reinstalled NoEyes),\n"
+                    "  or this could be an impersonation attempt.\n"
+                    "  Messages from this user will be shown with a ⚠ marker.\n"
+                    f"  If you trust them, type:  /trust {uname}"
+                ))
 
     # ------------------------------------------------------------------
     # DH handshake
@@ -1032,6 +1039,7 @@ class NoEyesClient:
             del self.tofu_store[peer]
             id_mod.save_tofu(self.tofu_store, self.tofu_path)
             self._tofu_mismatched.discard(peer)
+            self._tofu_warned.discard(peer)
             utils.print_msg(utils.cok(
                 f"[trust] Cleared stored key for '{peer}'.\n"
                 "  Their next key announcement will be trusted automatically."

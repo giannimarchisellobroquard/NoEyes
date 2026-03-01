@@ -387,10 +387,31 @@ def read_line_noecho() -> str:
         _g_buf          = []
         _g_input_active = True
 
+    import os as _os, select as _sel
+
+    def _readbyte() -> str:
+        """
+        Read exactly one byte directly from the raw file descriptor,
+        bypassing Python's internal stdio buffer entirely.
+
+        WHY NOT sys.stdin.read(1):
+          sys.stdin is a buffered TextIOWrapper.  When you call read(1),
+          Python may pull multiple bytes from the kernel into its own
+          internal buffer in one syscall.  A subsequent select() on the
+          same fd then returns False — the bytes are gone from the kernel
+          but haven't been returned yet — so the escape-sequence detector
+          thinks it got a lone ESC and lets the '[' and 'D' through as
+          printable characters, printing '[D' on the screen.
+
+          os.read(fd, 1) reads exactly one byte at the OS level every time,
+          keeping Python's buffer empty and making select() reliable.
+        """
+        return _os.read(fd, 1).decode("utf-8", errors="replace")
+
     try:
         tty.setcbreak(fd)
         while True:
-            ch = sys.stdin.read(1)
+            ch = _readbyte()
 
             if ch in ("\n", "\r"):
                 with _OUTPUT_LOCK:
@@ -420,17 +441,32 @@ def read_line_noecho() -> str:
                         sys.stdout.flush()
 
             elif ch == "\x1b":
-                # Peek with 50 ms timeout to tell lone ESC from escape sequences
-                import select as _sel
-                r, _, _ = _sel.select([sys.stdin], [], [], 0.20)
-                if r:
-                    nxt = sys.stdin.read(1)
-                    if nxt == "[":
-                        sys.stdin.read(1)   # consume arrow/function key byte
-                    # else: other escape sequence — discard nxt, do nothing
-                else:
-                    # Lone Escape — skip all ongoing animations
+                # Escape sequence detector.  Arrow / function keys send a
+                # multi-byte CSI sequence: ESC [ <final-byte>
+                # e.g. up=ESC[A  down=ESC[B  right=ESC[C  left=ESC[D
+                # We consume the whole sequence so nothing leaks into _g_buf.
+                #
+                # select() is reliable here because _readbyte() uses os.read()
+                # and never pre-fetches bytes into a Python-side buffer.
+                r, _, _ = _sel.select([fd], [], [], 0.05)
+                if not r:
+                    # Lone Escape — skip ongoing animations
                     trigger_skip_animation()
+                    continue
+                nxt = _readbyte()
+                if nxt == "[":
+                    # CSI sequence — read until the terminating byte
+                    # (an alphabetic char or '~').  Handles plain arrows
+                    # (ESC[A…D), shifted/ctrl arrows (ESC[1;2A…), F-keys, etc.
+                    while True:
+                        r2, _, _ = _sel.select([fd], [], [], 0.05)
+                        if not r2:
+                            break
+                        b = _readbyte()
+                        if b.isalpha() or b == "~":
+                            break   # final byte of sequence consumed
+                # else: other ESC sequence (e.g. ESC O A on some terminals) —
+                # nxt already consumed, nothing to do
 
             elif ch >= " ":
                 with _OUTPUT_LOCK:
