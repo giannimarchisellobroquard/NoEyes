@@ -284,7 +284,7 @@ python selftest.py
 
 ## Demo
 
-[![asciicast](https://asciinema.org/a/jEKQCJ8yNV0FU0gM.svg)](https://asciinema.org/a/jEKQCJ8yNV0FU0gM)
+[![asciicast](https://asciinema.org/a/cqiHbit8OdLqbuUZ.svg)](https://asciinema.org/a/cqiHbit8OdLqbuUZ)
 
 ---
 
