@@ -60,19 +60,230 @@ def clear_screen() -> None:
 # ASCII banner
 # ---------------------------------------------------------------------------
 
-BANNER = r"""
- _   _       _____
-| \ | | ___ | ____|_   _  ___  ___
-|  \| |/ _ \|  _| | | | |/ _ \/ __|
-| |\  | (_) | |___| |_| |  __/\__ \
-|_| \_|\___/|_____|\__, |\___||___/
-                   |___/
-  Secure Terminal Chat  |  E2E Encrypted
-"""
+BANNER = (
+    "\n"
+    "  ███╗   ██╗ ██████╗ ███████╗██╗   ██╗███████╗███████╗\n"
+    "  ████╗  ██║██╔═══██╗██╔════╝╚██╗ ██╔╝██╔════╝██╔════╝\n"
+    "  ██╔██╗ ██║██║   ██║█████╗   ╚████╔╝ █████╗  ███████╗\n"
+    "  ██║╚██╗██║██║   ██║██╔══╝    ╚██╔╝  ██╔══╝  ╚════██║\n"
+    "  ██║ ╚████║╚██████╔╝███████╗   ██║   ███████╗███████║\n"
+    "  ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝   ╚═╝   ╚══════╝╚══════╝\n"
+    "  Secure Terminal Chat  │  E2E Encrypted\n"
+)
 
 
 def print_banner() -> None:
     print(colorize(BANNER, CYAN, bold=True))
+
+
+# ---------------------------------------------------------------------------
+# CRT startup animation  (shown once on connect, never inside the chat)
+# ---------------------------------------------------------------------------
+
+def play_startup_animation() -> None:
+    """
+    CRT boot animation — slick full-window cold-start.
+    Skipped when stdout is not a TTY.
+    """
+    if not _is_tty():
+        return
+
+    import shutil
+
+    tw = shutil.get_terminal_size((80, 24)).columns
+    th = shutil.get_terminal_size((80, 24)).lines
+
+    ESC     = "\033"
+    RST     = ESC + "[0m"
+    BRT_WHT = ESC + "[1;37m"
+    BRT_CYN = ESC + "[1;96m"
+    CYN     = ESC + "[36m"
+    DIM_CYN = ESC + "[2;36m"
+    GRN     = ESC + "[32m"
+    BRT_GRN = ESC + "[1;32m"
+    DIM_GRN = ESC + "[2;32m"
+    GREY    = ESC + "[90m"
+    DIM     = ESC + "[2m"
+    BOLD    = ESC + "[1m"
+    CYANS   = [CYN, BRT_CYN, ESC + "[96m", ESC + "[1;36m"]
+    FRINGE  = [ESC + "[31m", ESC + "[32m", ESC + "[34m", ESC + "[96m", ESC + "[37m"]
+    GLITCH  = list("\u2588\u2593\u2592\u2591\u2584\u2580\u25a0\u25a1\u256c\u2560\u2563\u2550\u2551\xb7:!@#$%^&*")
+    NOISECH = list("\u2591\u2592\u2593\u2502\u2500\u253c\u256c\xb7:;!?$#@%")
+
+    def _goto(r, c=1):
+        sys.stdout.write(f"\033[{r};{c}H")
+
+    def _clr():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+    def _fill(color, char):
+        line = color + (char * tw) + RST
+        buf  = "".join(f"\033[{r};1H" + line for r in range(1, th + 1))
+        sys.stdout.write(buf)
+        sys.stdout.flush()
+
+    def _noise_frame():
+        buf = ""
+        for r in range(1, th + 1):
+            buf += f"\033[{r};1H" + "".join(
+                random.choice(CYANS) + random.choice(NOISECH) + RST
+                for _ in range(tw)
+            )
+        sys.stdout.write(buf)
+        sys.stdout.flush()
+
+    # ── 1. Flash ──────────────────────────────────────────────────────────────
+    _clr()
+    _fill(BRT_WHT, "\u2588")
+    time.sleep(0.04)
+    _clr()
+    time.sleep(0.02)
+
+    # ── 2. Glitch burst — scattered RGB tears ─────────────────────────────────
+    for _ in range(6):
+        row = random.randint(1, max(1, th - 1))
+        col = random.randint(1, max(1, tw - 25))
+        lng = random.randint(12, min(45, tw - col + 1))
+        _goto(row, col)
+        sys.stdout.write("".join(
+            random.choice(FRINGE) + random.choice(GLITCH) + RST
+            for _ in range(lng)
+        ))
+        sys.stdout.flush()
+        time.sleep(0.012)
+    _clr()
+
+    # ── 3. Phosphor ramp: black → green → cyan ────────────────────────────────
+    for col, char, delay in [
+        (DIM_GRN,          "\u2593", 0.030),
+        (GRN,              "\u2593", 0.025),
+        (BRT_GRN,          "\u2592", 0.025),
+        (CYN,              "\u2592", 0.025),
+        (BRT_CYN,          "\u2591", 0.020),
+        (ESC + "[96m",     "\u2591", 0.018),
+    ]:
+        _fill(col, char)
+        time.sleep(delay)
+    _clr()
+
+    # ── 4. Static burst — 3 quick noise frames ────────────────────────────────
+    for _ in range(3):
+        _noise_frame()
+        time.sleep(0.035)
+    _clr()
+
+    # ── 5. Beam sweep — full height, crisp and fast ───────────────────────────
+    beam  = BRT_CYN + ("\u2501" * tw) + RST
+    trail = DIM_CYN + ("\u2500" * tw) + RST
+    buf   = ""
+    for r in range(1, th + 1):
+        if r > 1:
+            buf += f"\033[{r-1};1H" + trail
+        buf += f"\033[{r};1H" + beam
+    sys.stdout.write(buf)
+    sys.stdout.flush()
+    # now animate it row by row at speed
+    _clr()
+    for r in range(1, th + 1):
+        out = ""
+        if r > 1:
+            out += f"\033[{r-1};1H" + trail
+        out += f"\033[{r};1H" + beam
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        time.sleep(0.007)
+    time.sleep(0.04)
+    _clr()
+
+    # ── 6. Logo burn-in — vertically & horizontally centred ───────────────────
+    logo_lines = BANNER.split("\n")
+    logo_h     = len(logo_lines)
+    logo_w     = 56
+    h_pad      = max(0, (tw - logo_w) // 2)
+    v_start    = max(1, (th - logo_h) // 2 - 2)
+    indent     = " " * h_pad
+
+    _clr()
+    cur_row = v_start
+    for line in logo_lines:
+        _goto(cur_row)
+        cur_row += 1
+        if not line.strip():
+            continue
+        vis = len(line)
+
+        # cipher flash
+        sys.stdout.write(indent + "".join(
+            random.choice(CYANS) + random.choice(GLITCH) + RST
+            for _ in range(min(vis, tw - h_pad))
+        ) + "\r")
+        sys.stdout.flush()
+        time.sleep(0.018)
+
+        # left-to-right wipe
+        step = max(1, vis // 6)
+        for s in range(0, vis, step):
+            e = min(s + step, vis)
+            sys.stdout.write(
+                indent +
+                BRT_CYN + line[:e] + RST +
+                "".join(
+                    random.choice(CYANS) + random.choice(GLITCH) + RST
+                    for _ in range(max(0, vis - e))
+                ) + "\r"
+            )
+            sys.stdout.flush()
+            time.sleep(0.008)
+
+        # lock in
+        sys.stdout.write(BRT_CYN + indent + line + RST)
+        sys.stdout.flush()
+        time.sleep(0.028)
+
+    # ── 7. Bloom pulse — two quick dim/bright flickers ────────────────────────
+    for delay in [0.05, 0.04]:
+        time.sleep(delay)
+        sys.stdout.write(DIM);  sys.stdout.flush(); time.sleep(0.03)
+        sys.stdout.write(RST);  sys.stdout.flush()
+
+    # ── 8. Tagline — centred, typed fast ─────────────────────────────────────
+    tagline = "E2E Encrypted  \xb7  Blind-Forwarder Server  \xb7  Zero Trust"
+    tag_col = max(1, (tw - len(tagline)) // 2)
+    _goto(cur_row + 1, tag_col)
+    for ch in tagline:
+        sys.stdout.write(CYN + ch + RST)
+        sys.stdout.flush()
+        time.sleep(0.012)
+
+    # ── 9. Boot status — fast scroll ─────────────────────────────────────────
+    status = [
+        ("SYS", "Ed25519 / X25519 / AES-256-GCM / Fernet"),
+        ("SYS", "Blind-forwarder protocol active         "),
+        ("OK ", "Identity loaded \u2014 transport armed         "),
+    ]
+    stat_col = max(1, (tw - 52) // 2)
+    stat_row = cur_row + 3
+    for tag, msg in status:
+        _goto(stat_row, stat_col)
+        stat_row += 1
+        col = GRN if tag == "OK " else GREY
+        sys.stdout.write(
+            GREY + "[" + RST + col + tag + RST + GREY + "] " + RST +
+            CYN + msg + RST
+        )
+        sys.stdout.flush()
+        time.sleep(0.075)
+
+    # ── 10. Two scanline flickers then hold ───────────────────────────────────
+    time.sleep(0.15)
+    for _ in range(2):
+        sys.stdout.write(DIM);        sys.stdout.flush(); time.sleep(0.04)
+        sys.stdout.write(RST + BOLD); sys.stdout.flush(); time.sleep(0.04)
+    sys.stdout.write(RST);  sys.stdout.flush()
+
+    time.sleep(0.55)
+    _clr()
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +416,8 @@ def switch_room_display(room_name: str, show_banner: bool = False) -> None:
     Clear the terminal, pin a sticky header at row 1 showing the room name,
     and set the scroll region to rows 2..N so messages scroll under it.
 
-    The room name stays visible even after hundreds of messages scroll past.
+    show_banner is kept for backward-compat but ignored — use
+    play_startup_animation() to show the logo before entering chat.
     """
     global _g_header
     _current_room[0] = room_name
@@ -219,15 +431,11 @@ def switch_room_display(room_name: str, show_banner: bool = False) -> None:
                 rows = 24
             # Build sticky header
             _g_header = colorize(f"  ══  {room_name}  ══", CYAN, bold=True)
-            # Clear screen
+            # Clear screen, pin header at row 1, set scroll region rows 2..N
             sys.stdout.write("[2J[H")
-            sys.stdout.flush()
-            if show_banner:
-                print(colorize(BANNER, CYAN, bold=True))
-            # Print header at row 1, then set scroll region from row 2 down
             sys.stdout.write(f"[1;1H[2K{_g_header}")
             sys.stdout.write(f"[2;{rows}r")   # scroll region = row 2..rows
-            sys.stdout.write("[2;1H")          # move cursor into scroll region
+            sys.stdout.write("[2;1H")          # cursor into scroll region
             sys.stdout.flush()
         else:
             _g_header = ""

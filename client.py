@@ -356,7 +356,8 @@ class NoEyesClient:
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
 
-            utils.switch_room_display(self.room, show_banner=True)
+            utils.play_startup_animation()
+            utils.switch_room_display(self.room)
             self._running = True
 
             self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
@@ -1013,7 +1014,7 @@ class NoEyesClient:
             return
 
         if cmd == "/clear":
-            utils.switch_room_display(self.room, show_banner=True)
+            utils.switch_room_display(self.room)
             return
 
         if cmd == "/users":
