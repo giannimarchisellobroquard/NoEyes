@@ -30,6 +30,7 @@ NoEyes is a Python terminal chat tool for small groups who need real privacy. Un
 | **Guided launcher** | Arrow-key menu UI — no command-line experience needed |
 | **Auto dependency installer** | Detects your platform, installs what's missing, asks before changing anything |
 | **Self-updater** | One command to pull the latest version from GitHub |
+| **29 acceptance tests** | Full automated test suite covering all major scenarios |
 
 ---
 
@@ -177,6 +178,7 @@ NoEyes/
 ├── install.ps1        Bootstrap for Windows PowerShell
 ├── install.bat        Bootstrap for Windows CMD
 │
+├── selftest.py        21-check automated acceptance test suite
 ├── demo2.py           Security features demo (tmux + asciinema)
 ├── selftest_demo2.py  Static analysis tests for demo2.py
 │
@@ -206,6 +208,140 @@ NoEyes/
 
 ---
 
+
+---
+
+## Running a Server Online — bore pub
+
+### The problem: port forwarding is often blocked
+
+When you start a NoEyes server at home, your machine gets a **local IP** (e.g. `192.168.1.5`). For someone outside your network to connect, you would normally need to open a port on your router and expose your **public IP**. In practice this almost always fails because:
+
+- Many ISPs (especially mobile data providers) put customers behind **CGNAT** — you don't even have a real public IP to forward
+- Even with a home router you control, the firewall rules are fiddly and the IP changes
+- Mobile networks routinely block inbound connections at the carrier level, regardless of what your router does
+
+bore pub solves this by creating a **secure tunnel** from your machine to a public relay, giving your server an instant public address without touching your router.
+
+---
+
+### What is bore?
+
+**bore** is an open-source TCP tunnel tool written in Rust by [**Eric Zhang** (@ekzhang)](https://github.com/ekzhang/bore).
+
+> _"A simple CLI tool for making tunnels to localhost"_
+
+When you run the NoEyes server, it automatically tries to start:
+
+```
+bore local 5000 --to bore.pub
+```
+
+This punches a tunnel from your local port 5000 to **bore.pub**, a free public relay. The relay assigns you a random port and prints an address like:
+
+```
+bore.pub:12345
+```
+
+You share that address with your friends — they connect with:
+
+```bash
+python noeyes.py --connect bore.pub --port 12345 --key-file ./chat.key
+```
+
+**Everything is still end-to-end encrypted.** bore only forwards raw bytes — it is as blind as the NoEyes server itself. The relay operator cannot read your messages.
+
+**Credit:** bore is created and maintained by Eric Zhang. Source code and documentation: https://github.com/ekzhang/bore
+
+---
+
+### bore pub limitations
+
+bore.pub is a **free public relay** maintained by the bore project. It is generous and available to anyone, but it has real limits you should understand:
+
+| Limitation | Details |
+|---|---|
+| **No uptime guarantee** | bore.pub is a volunteer service — it can go down, move, or change at any time |
+| **Shared bandwidth** | Heavy traffic (large file transfers, many concurrent users) can affect other bore users |
+| **Not for production** | If you are running NoEyes for a team or community, you should not depend on bore.pub long-term |
+| **Port is random** | Each server start gets a different port — you must reshare the address |
+| **No authentication** | Anyone who knows your bore.pub address can attempt to connect to your NoEyes server (your NoEyes key file still protects all content) |
+
+---
+
+### Why NoEyes is perfect for bore pub
+
+Most apps would overwhelm a free relay. NoEyes is different:
+
+- **Tiny bandwidth footprint** — messages are short. Even with 10 active users, NoEyes sends only a few KB per minute of idle chat
+- **Minimal CPU** — the server is a pure async forwarder. It does zero cryptography. On a Raspberry Pi it barely registers
+- **Low RAM** — the server holds only routing state, not message history. A 10-user session uses under 5 MB
+- **File transfers are streamed** — large files are chunked and pipelined, not buffered in memory on the server
+- **Idle = zero traffic** — when nobody is typing, nothing is sent
+
+A single bore.pub tunnel can handle a small NoEyes group indefinitely without putting meaningful load on the relay. **This is the use case bore.pub was designed for.**
+
+---
+
+### When to use a VPS instead
+
+If you are planning to use NoEyes with a larger group, run it persistently 24/7, or want a stable address, consider a **Virtual Private Server (VPS)**:
+
+**When to get a VPS:**
+- More than ~10 concurrent users
+- You want the server always online (not just when your laptop is open)
+- You want a stable hostname (not a random bore.pub port)
+- You want to run your own bore relay (so you are not depending on bore.pub at all)
+
+**Cheap VPS options** (as of 2025, prices change):
+- **Hetzner** — from €4/month, excellent for Europe
+- **DigitalOcean** — from $4/month, easy UI
+- **Vultr** — from $2.50/month
+- **Oracle Cloud** — always-free tier (2 VMs, 1 GB RAM each)
+- **Fly.io** — free hobby tier
+
+**Running NoEyes on a VPS:**
+
+```bash
+# On the VPS (no bore needed — it has a real public IP)
+git clone https://github.com/yourusername/NoEyes
+cd NoEyes
+python setup.py
+python noeyes.py --server --port 5000 --no-bore
+
+# Keep it running with screen or tmux
+screen -S noeyes
+python noeyes.py --server --port 5000 --no-bore
+# Ctrl+A, D to detach
+```
+
+**Running your own bore relay on a VPS:**
+
+```bash
+# Install bore server on the VPS
+cargo install bore-cli
+bore server --min-port 10000 --max-port 30000
+
+# Then on your home machine, point to your VPS instead of bore.pub
+bore local 5000 --to your-vps-ip
+```
+
+This gives you full control — no dependency on any third-party relay.
+
+---
+
+### Disabling bore (LAN / VPS / custom tunnel)
+
+If you are on a LAN, have a static IP, or use your own tunnel, start the server with:
+
+```bash
+python noeyes.py --server --port 5000 --no-bore
+```
+
+The `--no-bore` flag skips the tunnel entirely and prints your local IP for LAN connections.
+
+---
+
 ## Keeping NoEyes Up to Date
 
 ```bash
@@ -214,7 +350,39 @@ python update.py --check   # just check — don't change anything
 ```
 
 After updating, run `python setup.py --check` to make sure all dependencies are still satisfied.
+
 ---
+
+## Running the Tests
+
+```bash
+python selftest.py
+```
+
+```
+[PASS] Test 1   — Bob received group message
+[PASS] Test 2   — Server does NOT contain plaintext message body
+[PASS] Test 4   — Bob received private message
+[PASS] Test 5   — Server does NOT contain plaintext private message
+[PASS] Test 6   — Bob received and saved the file
+[PASS] Test 7   — Pairwise key survived room switch
+[PASS] Test 8   — /msg works after peer nick change
+[PASS] Test 9   — Simultaneous DH resolved
+[PASS] Test 10  — Reverse /msg delivered
+[PASS] Test 11  — /msg works after recipient switches room
+[PASS] Test 12  — /msg works after sender renames
+[PASS] Test 13  — All 3 queued messages delivered after DH
+[PASS] Test 14  — Cross-room nick change propagated
+[PASS] Test 15  — /msg to self rejected gracefully
+[PASS] Test 16  — DH re-established after reconnect
+[PASS] Test 17a — No duplicate on send
+[PASS] Test 17b — Own old message visible after /leave
+[PASS] Test 17c — Away message visible after /leave
+[PASS] Test 17d — No duplicate own msg after room switch
+[PASS] Test 17e — No duplicate away msg after room switch
+
+[PASS] All 29 acceptance checks passed.
+```
 
 ---
 
