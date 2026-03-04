@@ -361,6 +361,18 @@ def check_rust():
     except FileNotFoundError:
         return False
 
+def check_bore():
+    """Return True if bore binary is on PATH or in ~/.cargo/bin."""
+    cargo_bin = str(Path.home() / ".cargo" / "bin")
+    env = os.environ.copy()
+    if cargo_bin not in env.get("PATH", ""):
+        env["PATH"] = cargo_bin + os.pathsep + env.get("PATH", "")
+    try:
+        r = subprocess.run(["bore", "--version"], capture_output=True, env=env)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
 def check_cryptography():
     r = subprocess.run(
         [sys.executable, "-c", "import cryptography; print(cryptography.__version__)"],
@@ -379,6 +391,7 @@ def gather_status():
     need_rust      = not P.wheel_available()
     crypto_ok, cv  = check_cryptography()
 
+    bore_ok = check_bore()
     return {
         "python":       (py_ok,       py_ver),
         "pip":          (pip_ok,      "python -m pip"),
@@ -388,6 +401,7 @@ def gather_status():
                           else "needed for this platform")),
         "need_rust":    (need_rust,   ""),
         "cryptography": (crypto_ok,   cv if crypto_ok else "not installed"),
+        "bore":         (bore_ok,     "bore.pub tunnel" if bore_ok else "optional — needed to host a server online"),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -490,6 +504,68 @@ def install_rust():
     except Exception:
         return False
 
+# ── bore ─────────────────────────────────────────────────────────────────────
+
+def install_bore():
+    """
+    Install bore-cli via cargo — no sudo required anywhere.
+
+    Strategy:
+      1. If cargo is already available, run: cargo install bore-cli
+      2. If cargo is not available, install Rust via rustup (no sudo),
+         then run: cargo install bore-cli
+      3. On Termux, try pkg first (bore may be packaged).
+      4. On any platform, rustup --no-modify-path is always used so we
+         never touch system files.
+    """
+    # Termux: try native package (no compilation needed)
+    if P.is_termux:
+        if _ok_run(["pkg", "install", "-y", "bore"]):
+            return check_bore()
+
+    # Ensure cargo is available (install via rustup if not)
+    cargo_bin = str(Path.home() / ".cargo" / "bin")
+    cargo_env = os.environ.copy()
+    if cargo_bin not in cargo_env.get("PATH", ""):
+        cargo_env["PATH"] = cargo_bin + os.pathsep + cargo_env.get("PATH", "")
+
+    cargo_ok = False
+    try:
+        r = subprocess.run(["cargo", "--version"], capture_output=True, env=cargo_env)
+        cargo_ok = r.returncode == 0
+    except FileNotFoundError:
+        pass
+
+    if not cargo_ok:
+        # Install Rust via rustup — completely user-local, no sudo
+        import urllib.request, tempfile
+        try:
+            with urllib.request.urlopen("https://sh.rustup.rs") as resp:
+                script = resp.read()
+            with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
+                f.write(script); tmp = f.name
+            os.chmod(tmp, 0o755)
+            r = _run(["sh", tmp, "-y", "--no-modify-path"])
+            os.unlink(tmp)
+            if r.returncode != 0:
+                return False
+            os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
+            cargo_env["PATH"] = cargo_bin + os.pathsep + cargo_env.get("PATH", "")
+        except Exception:
+            return False
+
+    # Install bore-cli via cargo (installs to ~/.cargo/bin — no sudo)
+    r = subprocess.run(
+        ["cargo", "install", "bore-cli"],
+        capture_output=True, env=cargo_env
+    )
+    if r.returncode == 0:
+        # Make sure bore is in this process's PATH too
+        if cargo_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
+        return check_bore()
+    return False
+
 # ── cryptography ──────────────────────────────────────────────────────────────
 
 def install_cryptography():
@@ -560,6 +636,13 @@ def screen_status():
                    cry_ok,
                    "" if cry_ok else "the only required Python package"))
 
+    bore_ok, bore_d = st["bore"]
+    if bore_ok:
+        checks.append(("bore  (online tunnel)", bore_ok, "ready — bore.pub tunnel available"))
+    else:
+        checks.append(("bore  (online tunnel)", None,
+                       "optional — install if you want to host a server online"))
+
     # NoEyes core files
     here = Path(__file__).parent
     core = ["noeyes.py","server.py","client.py","encryption.py",
@@ -571,10 +654,16 @@ def screen_status():
     lines = []
     all_good = True
     for label, ok_flag, detail in checks:
-        icon = gr("✔") if ok_flag else rd("✘")
-        det  = f"  {gy(detail)}" if detail else ""
-        lines.append(f"{icon}  {label}{det}")
-        if not ok_flag: all_good = False
+        if ok_flag is None:
+            # Optional item — show as grey info, not a red failure
+            icon = gy("·")
+            det  = f"  {gy(detail)}" if detail else ""
+            lines.append(f"{icon}  {label}{det}")
+        else:
+            icon = gr("✔") if ok_flag else rd("✘")
+            det  = f"  {gy(detail)}" if detail else ""
+            lines.append(f"{icon}  {label}{det}")
+            if not ok_flag: all_good = False
 
     print(box("Dependency Status", lines, width=62))
     print()
@@ -602,19 +691,48 @@ def screen_confirm(st):
     if not cry_ok:
         to_install.append(("cryptography  (PyPI)", install_cryptography))
 
-    if not to_install:
+    bore_ok, _ = st["bore"]
+
+    # ── Optional: bore tunnel ────────────────────────────────────────────────
+    want_bore = False
+    if not bore_ok:
+        print(box("bore — Online Server Tunnel  (optional)", [
+            gy("bore pub lets you host a NoEyes server online without"),
+            gy("port-forwarding or a static IP. Your ISP or mobile data"),
+            gy("provider may block inbound connections — bore bypasses that."),
+            "",
+            gy("bore is open-source, free, and installs to ~/.cargo/bin"),
+            gy("(no sudo required on any platform)."),
+            "",
+            gy("You only need this if you plan to RUN a server."),
+            gy("Clients connecting to someone else's server don't need it."),
+            "",
+            cy("Credit: Eric Zhang — https://github.com/ekzhang/bore"),
+        ], colour=gy))
+        print()
+        want_bore = confirm("Install bore? (recommended for server operators)", default=False)
+        print()
+
+    if not to_install and not want_bore:
         return []
 
-    print(box("Ready to Install",
-        [f"{gy('·')}  {item[0]}" for item in to_install] +
-        ["",
-         "NoEyes needs these to run. Nothing else will be",
-         "installed or changed on your system."],
-        colour=cy))
+    items_display = [f"{gy('·')}  {item[0]}" for item in to_install]
+    if want_bore:
+        items_display.append(f"{gy('·')}  bore  (online tunnel via bore.pub)")
+
+    print(box("Ready to Install", items_display + [
+        "",
+        "NoEyes needs the required items to run.",
+        "bore is optional — only needed to host a server online.",
+        "Nothing else will be installed or changed on your system.",
+    ], colour=cy))
     print()
 
     if not confirm("Install everything now?", default=True):
         return None   # user said no
+
+    if want_bore:
+        to_install.append(("bore  (online tunnel)", install_bore))
 
     return to_install
 
@@ -645,8 +763,13 @@ def screen_done(success):
     clear()
     print(LOGO)
     if success:
+        bore_ok = check_bore()
+        bore_line = (gr("✔  bore installed — ready to host online (bore.pub)")
+                     if bore_ok else
+                     gy("·  bore not installed — run setup.py again if you need it"))
         print(box("Setup Complete", [
             gr("✔  All dependencies installed successfully."),
+            bore_line,
             "",
             f"Run  {cy(bo('python launch.py'))}  to start NoEyes.",
         ], colour=gr))

@@ -634,6 +634,130 @@ def _ensure_brew():
     os.unlink(tmp)
     ok("Homebrew installed")
 
+# ── bore (optional tunnel) ───────────────────────────────────────────────────
+
+def check_bore():
+    """Return True if bore binary is reachable."""
+    cargo_bin = str(Path.home() / ".cargo" / "bin")
+    env = os.environ.copy()
+    if cargo_bin not in env.get("PATH", ""):
+        env["PATH"] = cargo_bin + os.pathsep + env.get("PATH", "")
+    try:
+        r = subprocess.run(["bore", "--version"], capture_output=True, env=env)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def install_bore():
+    """
+    Install bore-cli — no sudo needed anywhere.
+
+    bore tunnels your local NoEyes server to bore.pub so people outside your
+    network can connect, even if your ISP blocks port-forwarding (CGNAT, mobile
+    data providers, etc.).
+
+    Install path:  ~/.cargo/bin/bore   (user-local, never touches system dirs)
+
+    Strategy:
+      Termux  → pkg install bore  (pre-built, no compilation)
+      Others  → cargo install bore-cli
+                If cargo is missing, install Rust first via rustup --no-modify-path
+    """
+    cargo_bin = str(Path.home() / ".cargo" / "bin")
+    cargo_env = os.environ.copy()
+    if cargo_bin not in cargo_env.get("PATH", ""):
+        cargo_env["PATH"] = cargo_bin + os.pathsep + cargo_env.get("PATH", "")
+
+    # ── Termux: try native package first (no compilation) ────────────────────
+    if P.is_termux:
+        info("Termux — trying pkg install bore...")
+        r = run(["pkg", "install", "-y", "bore"], check=False)
+        if r and r.returncode == 0 and check_bore():
+            ok("bore installed via pkg (Termux)")
+            return True
+        warn("pkg install bore failed — trying cargo...")
+
+    # ── Windows: cargo install or winget ─────────────────────────────────────
+    if P.system == "Windows":
+        # winget doesn't have bore yet; fall through to cargo
+        pass
+
+    # ── Ensure cargo is available ─────────────────────────────────────────────
+    cargo_ok = False
+    try:
+        r = subprocess.run(["cargo", "--version"], capture_output=True, env=cargo_env)
+        cargo_ok = r.returncode == 0
+    except FileNotFoundError:
+        pass
+
+    if not cargo_ok:
+        info("cargo not found — installing Rust via rustup (no sudo, user-local)...")
+        import urllib.request
+        try:
+            url = "https://sh.rustup.rs"
+            with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
+                tmp = f.name
+            with urllib.request.urlopen(url) as resp:
+                open(tmp, "wb").write(resp.read())
+            os.chmod(tmp, 0o755)
+            r = run(["sh", tmp, "-y", "--no-modify-path"], check=False)
+            os.unlink(tmp)
+            if r and r.returncode == 0:
+                os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
+                cargo_env["PATH"] = cargo_bin + os.pathsep + cargo_env.get("PATH", "")
+                ok("Rust installed via rustup")
+            else:
+                err("Rust install failed — cannot install bore")
+                info("Install Rust manually: https://rustup.rs  then run: cargo install bore-cli")
+                return False
+        except Exception as e:
+            err(f"Rust install failed: {e}")
+            return False
+
+    # ── Install bore via cargo ────────────────────────────────────────────────
+    info("Running: cargo install bore-cli  (compiles from source, may take a minute)...")
+    r = subprocess.run(["cargo", "install", "bore-cli"],
+                       capture_output=False, env=cargo_env)
+    if r.returncode == 0:
+        # Expose bore in this process's PATH too
+        if cargo_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
+        if check_bore():
+            ok("bore installed — bore.pub tunnel ready")
+            info("Start a tunnelled server with:  python noeyes.py --server")
+            info("(bore starts automatically — no extra flags needed)")
+            return True
+    err("cargo install bore-cli failed")
+    info("You can try manually later:  cargo install bore-cli")
+    return False
+
+def ensure_bore():
+    """Offer bore install interactively — skipped silently if user says no."""
+    step("Step 6 — bore  (optional — online server tunnel)")
+
+    if check_bore():
+        ok("bore already installed — bore.pub tunnel ready")
+        return
+
+    print()
+    print(f"  {cyan('What is bore?')}")
+    print("  bore creates a public tunnel from your machine to bore.pub so")
+    print("  anyone can connect to your NoEyes server — even if your ISP")
+    print("  blocks port-forwarding (very common on mobile/home broadband).")
+    print()
+    print(f"  {cyan('No sudo required.')} bore installs to ~/.cargo/bin")
+    print(f"  {cyan('Credit:')} Eric Zhang — https://github.com/ekzhang/bore")
+    print()
+    print(f"  {dim('Skip this if you are only connecting to someone else\'s server.')}")
+    print()
+
+    if not ask("Install bore? (recommended if you plan to run a server)", default="n"):
+        info("Skipped — run  python install.py  again anytime to add bore later")
+        return
+
+    print()
+    install_bore()
+
 # ── verification ──────────────────────────────────────────────────────────────
 
 def verify():
@@ -657,6 +781,13 @@ def verify():
         crypto_ok = False
 
     # NoEyes core files
+    # bore (optional)
+    bore_present = check_bore()
+    if bore_present:
+        ok("bore — online tunnel ready (bore.pub)")
+    else:
+        info("bore not installed — needed only to host a server online")
+
     here = Path(__file__).parent
     core = ["noeyes.py", "server.py", "client.py", "encryption.py",
             "identity.py", "utils.py", "config.py"]
@@ -697,6 +828,12 @@ def check_only():
     except ImportError:
         err("cryptography: not installed")
 
+    bore_ok = check_bore()
+    if bore_ok:
+        ok("bore: installed — bore.pub tunnel ready")
+    else:
+        info("bore: not installed  (optional — needed only to host a server online)")
+
     here = Path(__file__).parent
     core = ["noeyes.py", "server.py", "client.py", "encryption.py",
             "identity.py", "utils.py", "config.py"]
@@ -735,6 +872,8 @@ def main():
                     help="Reinstall even if already present")
     ap.add_argument("--no-rust", action="store_true",
                     help="Skip Rust install (pip may fail on exotic arches)")
+    ap.add_argument("--no-bore", action="store_true",
+                    help="Skip bore install prompt entirely")
     args = ap.parse_args()
 
     banner()
@@ -755,6 +894,10 @@ def main():
             ensure_rust_if_needed(pip_cmd)
 
         success = ensure_cryptography(pip_cmd, force=args.force)
+
+        print()
+        if not args.no_bore:
+            ensure_bore()
 
         print()
         if verify():
