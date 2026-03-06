@@ -9,6 +9,7 @@ import time
 import random
 import re
 import threading
+import signal
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
@@ -231,6 +232,17 @@ def _is_tty() -> bool:
         return os.isatty(sys.stdout.fileno())
     except Exception:
         return False
+
+
+def _set_title(text: str) -> None:
+    """Set the terminal window/tab title — visible while scrolling back."""
+    if not _is_tty():
+        return
+    # OSC 0 sets both icon name and window title; OSC 2 sets window title only.
+    # BEL () terminates the sequence; ST (\) is the proper terminator
+    # but BEL works universally including older xterm and Konsole.
+    sys.stdout.write(f"]0;{text}")
+    sys.stdout.flush()
 
 
 def colorize(text: str, color: str, bold: bool = False) -> str:
@@ -506,8 +518,36 @@ _room_logs      : dict = defaultdict(list)   # room -> [rendered_string, ...]
 _room_seen      : dict = defaultdict(set)    # room -> set of "ts|user|text" keys already animated
 _current_room   : list = ["general"]         # mutable single-element so closures can mutate it
 
+# ── TUI state ───────────────────────────────────────────────────────────────
+# _tui_active: True after enter_tui() is called.  All display code checks
+# this flag and takes the absolute-positioning path when set.
+_tui_active        : bool = False
+_tui_rows          : list = [24]            # cached terminal height
+_tui_cols          : list = [80]            # cached terminal width
+_scroll_offset     : dict = defaultdict(int)  # room -> lines scrolled up (0 = live)
+_unread_while_away : dict = defaultdict(int)  # new msgs received while scrolled back
+_resize_pending    : list = [False]           # set by SIGWINCH handler
+
 # Animation skip — set by Escape hotkey; auto-clears after 2 s so future messages still animate.
 _SKIP_ANIM : threading.Event = threading.Event()
+
+# ── Shimmer state ─────────────────────────────────────────────────────────────
+# The gradient shimmer runs in a background thread so it NEVER holds
+# _OUTPUT_LOCK for more than one brief frame write (~2 ms).  This means new
+# messages can always acquire the lock immediately and are never blocked.
+#
+# _SHIMMER_STOP   — set to kill the active shimmer thread instantly.
+# _shimmer_thread — current shimmer thread (or None).
+# _msg_queue_depth — number of _animate_msg calls currently waiting for the
+#                    lock.  If > 0 when a new animation starts, the shimmer is
+#                    suppressed (we're in a replay burst, not live chat).
+# _shimmer_msg_rows — how many terminal rows the last animated message occupied
+#                     so the shimmer thread knows how far to jump back.
+
+_SHIMMER_STOP      : threading.Event = threading.Event()
+_shimmer_thread    : threading.Thread = None   # type: ignore[assignment]
+_msg_queue_depth   : int  = 0
+_shimmer_msg_rows  : int  = 1
 
 def trigger_skip_animation() -> None:
     """
@@ -516,10 +556,190 @@ def trigger_skip_animation() -> None:
     Auto-resets after 2 s so future incoming messages still animate.
     """
     _SKIP_ANIM.set()
+    _stop_shimmer()
     def _auto_clear():
         time.sleep(2.0)
         _SKIP_ANIM.clear()
     threading.Thread(target=_auto_clear, daemon=True).start()
+
+
+def _stop_shimmer() -> None:
+    """
+    Kill the active shimmer thread (if any) and wait for it to finish its
+    current frame write before returning.  Safe to call from any thread.
+    """
+    global _shimmer_thread
+    _SHIMMER_STOP.set()
+    t = _shimmer_thread
+    if t and t.is_alive():
+        t.join(timeout=0.15)   # at most one frame delay (45 ms) + margin
+    _shimmer_thread = None
+
+
+def _tui_last_msg_pos(room: str) -> tuple:
+    """
+    Compute (start_row, n_rows) of the LAST visible message in the TUI viewport.
+    Uses the same layout logic as _tui_draw_viewport_unsafe so it is always in sync.
+    Returns (None, 0) if there are no messages or the window is too small.
+    Caller must hold _OUTPUT_LOCK.
+    """
+    rows, cols, vp_start, vp_end, sep_row, inp_row = _tui_layout()
+    vh = max(1, vp_end - vp_start + 1)
+    if cols < 1:
+        return None, 0
+    log = list(_room_logs[room])
+    if not log:
+        return None, 0
+
+    # Mirror _tui_draw_viewport_unsafe: walk backwards collecting messages
+    selected = []
+    used_rows = 0
+    for i in range(len(log) - 1, -1, -1):
+        mr = max(1, (len(_strip_ansi(log[i])) + cols - 1) // cols)
+        if used_rows + mr > vh:
+            break
+        selected.insert(0, log[i])
+        used_rows += mr
+
+    if not selected:
+        return None, 0
+
+    # Walk forward to find where the last message starts
+    start_row = vp_start + (vh - used_rows)
+    for msg in selected[:-1]:
+        mr = max(1, (len(_strip_ansi(msg)) + cols - 1) // cols)
+        start_row += mr
+
+    last_mr = max(1, (len(_strip_ansi(selected[-1])) + cols - 1) // cols)
+    return start_row, last_mr
+
+
+def _shimmer_bg(prefix: str, plaintext: str, tokens: list, msg_rows: int, tui_vp_end: int = None, room: str = "general") -> None:
+    """
+    Background thread: continuously animate styled words with a per-character
+    gradient colour wave, char-by-char across the whole line, looping until:
+      • _SHIMMER_STOP is set (new message queued or ESC pressed)
+      • _g_buf becomes non-empty (user started typing)
+      • _SKIP_ANIM is set
+
+    TUI mode: uses _tui_last_msg_pos() to find the exact rows of the last
+    message and writes ONLY to those rows — no full viewport redraws, which
+    were causing the whole screen to flicker and long messages to ghost.
+
+    Plain mode: uses relative cursor movement to step up msg_rows lines,
+    erase, rewrite, then redraw input.
+    """
+    # Pre-flatten tokens → (char, style) list
+    all_chars: list = []
+    for idx, (word, style) in enumerate(tokens):
+        for ch in word:
+            all_chars.append((ch, style))
+        if idx < len(tokens) - 1:
+            all_chars.append((" ", "normal"))
+
+    has_gradient = any(_KZ_GRADIENTS.get(sty) for _, sty in all_chars)
+    if not has_gradient:
+        return   # nothing to shimmer — exit immediately
+
+    max_depth = max((len(g) for g in _KZ_GRADIENTS.values() if g), default=4)
+    offset    = 0
+    frame_dt  = 0.045   # ~22 fps
+
+    def _erase_msg_area_plain() -> None:
+        sys.stdout.write(f"\033[{msg_rows}A\r")
+        for i in range(msg_rows):
+            sys.stdout.write("\033[2K")
+            if i < msg_rows - 1:
+                sys.stdout.write("\033[1B\r")
+        if msg_rows > 1:
+            sys.stdout.write(f"\033[{msg_rows - 1}A\r")
+
+    def _build_gradient_line() -> str:
+        parts = [RESET, prefix]
+        for i, (ch, sty) in enumerate(all_chars):
+            grad = _KZ_GRADIENTS.get(sty, [])
+            if grad:
+                parts.append(grad[(offset + i) % len(grad)] + ch + RESET)
+            else:
+                parts.append(ch)
+        parts.append(RESET)
+        return "".join(parts)
+
+    def _build_final_line() -> str:
+        parts = [RESET, prefix]
+        for i, (word, style) in enumerate(tokens):
+            parts.append(_kz_render(word, style))
+            if i < len(tokens) - 1:
+                parts.append(" ")
+        parts.append(RESET)
+        return "".join(parts)
+
+    def _write_tui_rows(line: str) -> None:
+        """
+        Write line to the exact rows the last message occupies. Caller holds lock.
+        Restricts scroll region to only those rows so long text wraps naturally
+        across them without scrolling the rest of the viewport.
+        """
+        start_row, n_rows = _tui_last_msg_pos(room)
+        if start_row is None:
+            return
+        end_row = start_row + n_rows - 1
+        # Erase just the rows this message occupies
+        for r in range(start_row, end_row + 1):
+            sys.stdout.write(f"\033[{r};1H\033[2K")
+        # Narrow scroll region to these rows, enable wrap, then write.
+        # A newline at end_row only scrolls within [start_row..end_row]
+        # so nothing outside shifts.
+        _, _, vs, ve, _, _ = _tui_layout()
+        sys.stdout.write(f"\033[{start_row};{end_row}r")
+        sys.stdout.write("\033[?7h")
+        sys.stdout.write(f"\033[{start_row};1H")
+        sys.stdout.write(line)
+        # Restore the real viewport scroll region
+        sys.stdout.write(f"\033[{vs};{ve}r")
+
+    def _write_gradient_frame() -> None:
+        with _OUTPUT_LOCK:
+            if tui_vp_end is not None:
+                _erase_input_unsafe()
+                _write_tui_rows(_build_gradient_line())
+                _redraw_input_unsafe()
+            else:
+                _erase_input_unsafe()
+                _erase_msg_area_plain()
+                sys.stdout.write(_build_gradient_line() + "\n")
+                _redraw_input_unsafe()
+            sys.stdout.flush()
+
+    def _write_final_frame() -> None:
+        with _OUTPUT_LOCK:
+            final_line = _build_final_line()
+            if tui_vp_end is not None:
+                # Update log entry so future viewport redraws use static color
+                if _room_logs[room]:
+                    _room_logs[room][-1] = final_line
+                _erase_input_unsafe()
+                _write_tui_rows(final_line)
+                _redraw_input_unsafe()
+            else:
+                _erase_input_unsafe()
+                _erase_msg_area_plain()
+                sys.stdout.write(final_line + "\n")
+                _redraw_input_unsafe()
+            sys.stdout.flush()
+
+    # ── Shimmer loop ──────────────────────────────────────────────────────────
+    while (
+        not _SHIMMER_STOP.is_set()
+        and not _g_buf
+        and not _SKIP_ANIM.is_set()
+    ):
+        _write_gradient_frame()
+        time.sleep(frame_dt)
+        offset = (offset + 1) % max_depth
+
+    # ── Final static write — ALWAYS runs so no char is ever left multicolored ─
+    _write_final_frame()
 
 
 
@@ -534,15 +754,20 @@ def _erase_input_unsafe() -> None:
     """
     Erase partial input from screen. Caller must hold _OUTPUT_LOCK.
 
-    Cursor may be anywhere within _g_buf (left/right arrows move it).
-    We need to move UP to the start row of the input, then clear down.
-    The cursor is at column (_g_cur % tw) on row (_g_cur // tw) of the
-    input area, so we go up that many rows to reach the input start row.
+    TUI mode:  jump to inp_row (row N) and clear the line — O(1), no arithmetic.
+    Plain mode: use relative cursor movement to find and clear the input row.
     """
-    if not _g_input_active or not _g_buf:
+    if not _g_input_active:
+        return
+    if _tui_active:
+        inp_row = _tui_rows[0]
+        sys.stdout.write(f"\033[{inp_row};1H\033[2K")
+        sys.stdout.flush()
+        return
+    if not _g_buf:
         return
     tw      = _get_tw()
-    rows_up = _g_cur // tw      # rows above cursor to reach start of input
+    rows_up = _g_cur // tw
     if rows_up:
         sys.stdout.write("\033[" + str(rows_up) + "A")
     sys.stdout.write("\r\033[J")
@@ -553,10 +778,31 @@ def _redraw_input_unsafe() -> None:
     """
     Redraw partial input with cursor at _g_cur. Caller must hold _OUTPUT_LOCK.
 
-    Prints the entire buffer then moves the cursor left by however many
-    characters trail after the cursor position.
+    TUI mode:  shows a scrolling WINDOW of cols-1 chars around the cursor so
+               the buffer NEVER wraps past the single input row into the
+               separator / message area above it.
+    Plain mode: write buffer relative to current cursor position.
     """
     if not _g_input_active:
+        return
+    if _tui_active:
+        inp_row = _tui_rows[0]
+        cols    = max(10, _tui_cols[0])
+        win     = cols - 1          # visible chars in the input row
+        sys.stdout.write(f"\033[{inp_row};1H\033[2K")
+        if _g_buf:
+            # Scroll window so cursor is always visible
+            # win_start: keep cursor inside [win_start, win_start+win)
+            win_start = max(0, _g_cur - win + 1)
+            win_start = min(win_start, max(0, len(_g_buf) - win))
+            win_end   = min(len(_g_buf), win_start + win)
+            sys.stdout.write("".join(_g_buf[win_start:win_end]))
+            # Reposition cursor within the visible window
+            cur_in_win = _g_cur - win_start
+            chars_after = (win_end - win_start) - cur_in_win
+            if chars_after > 0:
+                sys.stdout.write(f"\033[{chars_after}D")
+        sys.stdout.flush()
         return
     if not _g_buf:
         return
@@ -568,31 +814,286 @@ def _redraw_input_unsafe() -> None:
 
 
 def _redraw_header_unsafe() -> None:
-    """Re-stamp the sticky header at row 1. Caller holds _OUTPUT_LOCK."""
-    if not _g_header or not _is_tty():
+    """Re-stamp the room header at row 1 (TUI mode). Caller holds _OUTPUT_LOCK."""
+    if not _tui_active or not _g_header:
         return
-    try:
-        rows = os.get_terminal_size().lines
-    except OSError:
-        rows = 24
-    sys.stdout.write(f"[s[1;1H[2K{_g_header}[2;{rows}r[u")
+    cols = _tui_cols[0]
+    bar  = colorize("─" * cols, GREY)
+    sys.stdout.write(f"\033[s\033[1;1H\033[2K{_g_header}\n{bar}\033[u")
     sys.stdout.flush()
 
 
-def print_msg(text: str) -> None:
-    """Print a line of output, cleanly interleaving with in-progress input."""
-    if not _is_tty():
-        print(text)
+# ---------------------------------------------------------------------------
+# TUI core — alternate screen, absolute layout, internal scrollback
+# ---------------------------------------------------------------------------
+
+def _tui_size() -> tuple:
+    """Return (rows, cols) and refresh cached values."""
+    try:
+        sz = os.get_terminal_size()
+        rows, cols = sz.lines, sz.columns
+    except OSError:
+        rows, cols = 24, 80
+    _tui_rows[0], _tui_cols[0] = rows, cols
+    return rows, cols
+
+
+def _tui_layout() -> tuple:
+    """Return (rows, cols, vp_start, vp_end, sep_row, inp_row)."""
+    rows, cols = _tui_rows[0], _tui_cols[0]
+    # Row 1        = header
+    # Rows 2..N-2  = viewport (scroll region)
+    # Row N-1      = separator
+    # Row N        = input bar
+    return rows, cols, 2, rows - 2, rows - 1, rows
+
+
+def _tui_draw_viewport_unsafe() -> None:
+    """
+    Redraw the message viewport from _room_logs respecting _scroll_offset.
+    Caller holds _OUTPUT_LOCK.
+
+    We compute how many terminal rows each message occupies (ceiling division)
+    and show the most recent messages that fit, bottom-aligned in the viewport.
+    The scroll region (set in _tui_full_redraw_unsafe) keeps content inside.
+    """
+    room = _current_room[0]
+    rows, cols, vp_start, vp_end, sep_row, inp_row = _tui_layout()
+    vh = max(1, vp_end - vp_start + 1)
+    if cols < 1:
         return
+
+    log    = list(_room_logs[room])
+    offset = max(0, min(_scroll_offset.get(room, 0), max(0, len(log) - 1)))
+    _scroll_offset[room] = offset
+
+    end_idx = max(0, len(log) - offset)
+
+    # Walk backwards through log collecting messages until we fill vh rows
+    selected = []
+    used_rows = 0
+    for i in range(end_idx - 1, -1, -1):
+        msg_rows = max(1, (len(_strip_ansi(log[i])) + cols - 1) // cols)
+        if used_rows + msg_rows > vh:
+            break
+        selected.insert(0, log[i])
+        used_rows += msg_rows
+
+    # Erase entire viewport
+    for r in range(vp_start, vp_end + 1):
+        sys.stdout.write(f"\033[{r};1H\033[2K")
+
+    # Write each message at its computed row using absolute positioning.
+    # Never use \n — a \n at vp_end scrolls the whole scroll region up,
+    # which causes long messages to jump/duplicate then snap back.
+    cur_row = vp_start + (vh - used_rows)
+    for msg in selected:
+        mr = max(1, (len(_strip_ansi(msg)) + cols - 1) // cols)
+        sys.stdout.write(f"\033[{cur_row};1H\033[?7h")  # ensure wrap ON
+        sys.stdout.write(msg)
+        cur_row += mr
+
+    # Scroll-back indicator overlaid at vp_end
+    if offset > 0:
+        unread = _unread_while_away.get(room, 0)
+        if unread:
+            ind = colorize(f"  \u2193 {unread} new \u2014 scroll down to resume live ", CYAN, bold=True)
+        else:
+            ind = colorize(f"  \u2191 scrolled back {offset} \u2014 PageDn or scroll to resume ", GREY)
+        sys.stdout.write(f"\033[{vp_end};1H\033[2K{ind}")
+
+    sys.stdout.flush()
+
+
+def _tui_full_redraw_unsafe() -> None:
+    """
+    Full TUI screen redraw. Caller holds _OUTPUT_LOCK.
+    Guards against tiny windows (< 6 rows) by falling back to plain output.
+    """
+    rows, cols, vp_start, vp_end, sep_row, inp_row = _tui_layout()
+
+    if rows < 4 or cols < 10:
+        # Window too small for TUI — just print header in plain mode
+        sys.stdout.write("\033[2J\033[H")
+        if _g_header:
+            sys.stdout.write(_g_header + "\n")
+        sys.stdout.flush()
+        return
+
+    # Set scroll region to viewport only (rows vp_start..vp_end)
+    sys.stdout.write(f"\033[{vp_start};{vp_end}r")
+    # Clear full screen
+    sys.stdout.write("\033[2J")
+
+    # Row 1: header
+    sys.stdout.write(f"\033[1;1H\033[2K")
+    if _g_header:
+        sys.stdout.write(_g_header)
+
+    # Row N-1: separator
+    sys.stdout.write(f"\033[{sep_row};1H\033[2K")
+    sys.stdout.write(colorize("\u2500" * cols, GREY))
+
+    # Row N: input bar label
+    sys.stdout.write(f"\033[{inp_row};1H\033[2K")
+
+    # Viewport content
+    _tui_draw_viewport_unsafe()
+
+    # Restore cursor to input row
+    sys.stdout.write(f"\033[{inp_row};1H")
+    if _g_buf:
+        sys.stdout.write("".join(_g_buf))
+        trail = len(_g_buf) - _g_cur
+        if trail > 0:
+            sys.stdout.write(f"\033[{trail}D")
+
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+
+
+def _tui_scroll(delta: int) -> None:
+    """
+    Scroll the viewport by delta lines.
+    delta > 0 = scroll up (older messages), delta < 0 = scroll down (newer).
+    Called from read_line_noecho on mouse wheel / PageUp/Down.
+    """
+    room = _current_room[0]
+    log  = _room_logs[room]
+    vh   = max(1, _tui_rows[0] - 3)
+    max_off = max(0, len(log) - 1)
+    old_off = _scroll_offset.get(room, 0)
+    new_off = max(0, min(max_off, old_off + delta))
+    if new_off == old_off:
+        return
+    _scroll_offset[room] = new_off
+    if new_off == 0:
+        _unread_while_away[room] = 0
     with _OUTPUT_LOCK:
         _erase_input_unsafe()
-        print(text)
+        _tui_draw_viewport_unsafe()
         _redraw_input_unsafe()
 
 
+def enter_tui() -> None:
+    """
+    Enter the alternate screen buffer and set up the TUI layout.
+    Safe to call multiple times (no-op if already active).
+    If switch_room_display() was already called before enter_tui(),
+    a full redraw is triggered so the header/viewport/input are painted correctly.
+    """
+    global _tui_active
+    if not _is_tty() or _tui_active:
+        return
+    _tui_active = True
+    _tui_size()
+    sys.stdout.write(
+        "\033[?1049h"   # enter alternate screen
+        "\033[?1007h"   # alternate scroll: wheel -> arrow keys, no click capture
+        # Text selection works normally. Scroll wheel sends ESC[A/ESC[B.
+    )
+    sys.stdout.flush()
+    try:
+        signal.signal(signal.SIGWINCH, _handle_resize)
+    except (AttributeError, OSError):
+        pass
+    # Always do a full redraw after entering alt screen so any prior
+    # switch_room_display() call (which ran in plain mode) is applied.
+    with _OUTPUT_LOCK:
+        _tui_full_redraw_unsafe()
+
+def exit_tui() -> None:
+    """
+    Exit the alternate screen buffer and restore the main screen.
+    Call on disconnect / quit.
+    """
+    global _tui_active
+    if not _tui_active:
+        return
+    _stop_shimmer()
+    _tui_active = False
+    sys.stdout.write(
+        "\033[?1007l"   # disable alternate scroll
+        "\033[r"        # reset scroll region
+        "\033[?25h"     # ensure cursor visible
+        "\033[?1049l"   # exit alternate screen
+    )
+    sys.stdout.flush()
+
+
+def _handle_resize(signum, frame) -> None:
+    """SIGWINCH handler — update cached size and immediately redraw the TUI.
+    A background thread is used so we never block inside a signal handler."""
+    try:
+        sz = os.get_terminal_size()
+        _tui_rows[0], _tui_cols[0] = sz.lines, sz.columns
+    except OSError:
+        pass
+    _resize_pending[0] = True
+
+    def _do_resize():
+        # Brief debounce so rapid drags only trigger one redraw
+        time.sleep(0.05)
+        if not _tui_active:
+            return
+        _resize_pending[0] = False
+        with _OUTPUT_LOCK:
+            _tui_size()            # refresh cached dims
+            rows2, cols2, vs, ve, sr, ir = _tui_layout()
+            sys.stdout.write(f"\033[{vs};{ve}r")   # re-assert scroll region
+            _tui_full_redraw_unsafe()
+
+    threading.Thread(target=_do_resize, daemon=True).start()
+
+
+def print_msg(text: str, _skip_log: bool = False) -> None:
+    """Print a line of output, cleanly interleaving with in-progress input.
+
+    In TUI mode every call is also appended to the room log so that /help,
+    system messages, connection status, and all other transient output
+    persists in the viewport (it was disappearing before because the viewport
+    only redraws from _room_logs).
+
+    Pass _skip_log=True from call sites that have ALREADY appended to
+    _room_logs (i.e. _animate_msg) to avoid double-entries.
+    """
+    if not _is_tty():
+        print(text)
+        return
+    try:
+        acquired = False
+        while not acquired:
+            acquired = _OUTPUT_LOCK.acquire(timeout=0.05)
+        try:
+            if _tui_active:
+                _erase_input_unsafe()
+                room   = _current_room[0]
+                if not _skip_log:
+                    _room_logs[room].append(text)
+                offset = _scroll_offset.get(room, 0)
+                if offset > 0:
+                    _unread_while_away[room] = _unread_while_away.get(room, 0) + 1
+                _tui_draw_viewport_unsafe()
+                _redraw_input_unsafe()
+            else:
+                _erase_input_unsafe()
+                print(text)
+                _redraw_input_unsafe()
+        finally:
+            _OUTPUT_LOCK.release()
+    except KeyboardInterrupt:
+        pass   # silently discard print during shutdown — caller handles Ctrl+C
+
+
 def log_and_print(room: str, text: str) -> None:
-    """Store message in room log and print it (no animation)."""
-    _room_logs[room].append(text)
+    """Store message in room log and print it (no animation).
+
+    In plain mode: appends to log then prints.
+    In TUI mode:  print_msg handles the append, so we skip it here to avoid
+                  double-entries in the viewport.
+    """
+    if not _tui_active:
+        _room_logs[room].append(text)
     print_msg(text)
 
 
@@ -612,36 +1113,34 @@ def mark_seen(room: str, from_user: str, ts: str, text: str) -> None:
 
 def switch_room_display(room_name: str, show_banner: bool = False) -> None:
     """
-    Clear the terminal, pin a sticky header at row 1 showing the room name,
-    and set the scroll region to rows 2..N so messages scroll under it.
+    Switch to room_name.
 
-    show_banner is kept for backward-compat but ignored — use
-    play_startup_animation() to show the logo before entering chat.
+    TUI mode:   full TUI redraw with pinned header, scroll region viewport,
+                separator, and input bar.  History is per-room in _room_logs.
+    Plain mode: clear screen, print header, reset scroll region.
     """
     global _g_header
     _current_room[0] = room_name
-    _room_logs[room_name].clear()   # server replay will refill it
+    _scroll_offset[room_name]     = 0   # start at live view
+    _unread_while_away[room_name] = 0
+    _room_logs[room_name].clear()       # server replay will refill it
     with _OUTPUT_LOCK:
         _erase_input_unsafe()
-        if _is_tty():
-            try:
-                rows = os.get_terminal_size().lines
-            except OSError:
-                rows = 24
-            # Build sticky header
-            _g_header = colorize(f"  ══  {room_name}  ══", CYAN, bold=True)
-            # Clear screen, pin header at row 1, set scroll region rows 2..N
-            sys.stdout.write("[2J[H")
-            sys.stdout.write(f"[1;1H[2K{_g_header}")
-            sys.stdout.write(f"[2;{rows}r")   # scroll region = row 2..rows
-            sys.stdout.write("[2;1H")          # cursor into scroll region
+        _g_header = colorize(f"  ══  {room_name}  ══", CYAN, bold=True)
+        _set_title(f"NoEyes │ #{room_name}")
+        if _tui_active:
+            _tui_size()   # refresh cached dimensions on room switch
+            _tui_full_redraw_unsafe()
+        elif _is_tty():
+            sys.stdout.write("[3J[2J[H")
+            sys.stdout.write("[r")
+            sys.stdout.write(_g_header + "\n\n")
             sys.stdout.flush()
         else:
             _g_header = ""
             print(colorize(f"  ══  {room_name}  ══", CYAN, bold=True))
             print()
         _redraw_input_unsafe()
-
 
 # Alias used in older call sites
 def clear_for_room(room_name: str, show_banner: bool = False) -> None:
@@ -679,16 +1178,8 @@ def _strip_ansi(s: str) -> str:
 
 def _run_animation(prefix: str, plaintext: str) -> None:
     """
-    Wave animation using DECSC/DECRC (\0337/\0338) save-restore cursor.
-
-    At every step we restore to the saved position and rewrite the full
-    current wave state — no cursor arithmetic, no line-wrap maths, works
-    at any terminal width.
-
-    Wave state at step i:
-      plaintext[0 .. i-WAVE]     already revealed (plaintext chars)
-      cipher x WAVE              the moving cipher window
-    End-of-wave drain reveals the last WAVE chars one by one.
+    Cipher wave animation. Uses row-overwrite for TUI mode (absolute row),
+    DECSC/DECRC for plain mode.
     """
     WAVE = 6
     n    = len(plaintext)
@@ -697,37 +1188,38 @@ def _run_animation(prefix: str, plaintext: str) -> None:
         sys.stdout.flush()
         return
 
-    # ── fast path ─────────────────────────────────────────────────────────────
     if _SKIP_ANIM.is_set():
         sys.stdout.write(prefix + plaintext + RESET + "\n")
         sys.stdout.flush()
         return
 
-    # Save cursor position — we restore here at every frame
-    sys.stdout.write("\0337")
-    sys.stdout.flush()
-
-    def _write_state(revealed: int, wave_end: int) -> None:
-        """Restore to saved pos, write prefix + plaintext[:revealed] + cipher window."""
-        sys.stdout.write("\0338" + RESET + prefix)
-        if revealed > 0:
-            sys.stdout.write(plaintext[:revealed])
-        for _ in range(wave_end - revealed):
-            sys.stdout.write(
-                random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET
-            )
+    if _tui_active:
+        vp_end = _tui_rows[0] - 2
+        def _write_state(revealed: int, wave_end: int) -> None:
+            sys.stdout.write(f"\033[{vp_end};1H\033[2K" + RESET + prefix)
+            if revealed > 0:
+                sys.stdout.write(plaintext[:revealed])
+            for _ in range(wave_end - revealed):
+                sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
+            sys.stdout.flush()
+    else:
+        sys.stdout.write("\0337")
         sys.stdout.flush()
+        def _write_state(revealed: int, wave_end: int) -> None:
+            sys.stdout.write("\0338" + RESET + prefix)
+            if revealed > 0:
+                sys.stdout.write(plaintext[:revealed])
+            for _ in range(wave_end - revealed):
+                sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
+            sys.stdout.flush()
 
-    # ── main wave ─────────────────────────────────────────────────────────────
     for i in range(n):
         if _SKIP_ANIM.is_set():
             break
-        # revealed = chars before the WAVE window
         revealed = max(0, i + 1 - WAVE)
         _write_state(revealed, i + 1)
         time.sleep(_CIPHER_CHAR_DELAY)
 
-    # ── end-of-wave drain: reveal last WAVE chars one by one ─────────────────
     end_delay = min(_PLAIN_CHAR_MAX, _REVEAL_PAUSE / max(WAVE, 1))
     for k in range(max(0, n - WAVE), n):
         if _SKIP_ANIM.is_set():
@@ -735,8 +1227,11 @@ def _run_animation(prefix: str, plaintext: str) -> None:
         _write_state(k + 1, n)
         time.sleep(end_delay)
 
-    # ── final clean overwrite ─────────────────────────────────────────────────
-    sys.stdout.write("\0338" + RESET + prefix + plaintext + RESET + "\n")
+    if _tui_active:
+        vp_end = _tui_rows[0] - 2
+        sys.stdout.write(f"\033[{vp_end};1H\033[2K" + RESET + prefix + plaintext + RESET + "\n")
+    else:
+        sys.stdout.write("\0338" + RESET + prefix + plaintext + RESET + "\n")
     sys.stdout.flush()
 
 
@@ -990,6 +1485,50 @@ _KZ_STYLES = {
     "normal":      "",               # default terminal color
 }
 
+# ── Katana Zero gradient palettes — char-by-char colour shimmer ──────────────
+# 4-step palettes: dim → mid → saturated → bright, matching each word style.
+# "normal" is empty — unstyled words stay static during shimmer.
+
+_KZ_GRADIENTS = {
+    # shout — red ramp, no ambiguity
+    "shout":        ["\033[31m",        "\033[1;31m",      "\033[91m",        "\033[1;91m"],
+    # trailing — grey ramp, dim to mid
+    "trailing":     ["\033[2;90m",      "\033[90m",        "\033[2;37m",      "\033[90m"],
+    # mention — pure magenta ramp
+    "mention":      ["\033[35m",        "\033[1;35m",      "\033[95m",        "\033[1;95m"],
+    # number — amber/orange ramp, no red
+    "number":       ["\033[33m",        "\033[38;5;208m",  "\033[38;5;214m",  "\033[38;5;220m"],
+    # intense — white ramp
+    "intense":      ["\033[37m",        "\033[1;37m",      "\033[97m",        "\033[1;97m"],
+    # happy — green ramp
+    "happy":        ["\033[32m",        "\033[1;32m",      "\033[92m",        "\033[1;92m"],
+    # angry — pure red/orange-red only, no blue or ambiguous codes
+    "angry":        ["\033[31m",        "\033[1;31m",      "\033[91m",        "\033[1;91m"],
+    # sad — pure blue ramp
+    "sad":          ["\033[34m",        "\033[1;34m",      "\033[94m",        "\033[1;34m"],
+    # shocked — yellow ramp
+    "shocked":      ["\033[33m",        "\033[1;33m",      "\033[93m",        "\033[1;93m"],
+    # question — cyan ramp
+    "question":     ["\033[36m",        "\033[1;36m",      "\033[96m",        "\033[1;96m"],
+    # excited — magenta→pink ramp (no blue)
+    "excited":      ["\033[35m",        "\033[1;35m",      "\033[95m",        "\033[1;95m"],
+    # uncertain — grey ramp
+    "uncertain":    ["\033[2;37m",      "\033[37m",        "\033[90m",        "\033[2;37m"],
+    # threat — red ramp (same family as shout but slightly different rhythm)
+    "threat":       ["\033[31m",        "\033[91m",        "\033[1;31m",      "\033[1;91m"],
+    # timepressure — yellow/gold ramp
+    "timepressure": ["\033[33m",        "\033[1;33m",      "\033[93m",        "\033[1;33m"],
+    # social — cyan ramp (distinct from question by being lighter)
+    "social":       ["\033[36m",        "\033[96m",        "\033[1;36m",      "\033[1;96m"],
+    # agreement — green ramp
+    "agreement":    ["\033[32m",        "\033[92m",        "\033[1;32m",      "\033[1;92m"],
+    # disagreement — red ramp (softer than shout/threat)
+    "disagreement": ["\033[31m",        "\033[91m",        "\033[1;31m",      "\033[91m"],
+    # greeting — yellow ramp
+    "greeting":     ["\033[33m",        "\033[93m",        "\033[1;33m",      "\033[1;33m"],
+    "normal":       [],
+}
+
 # ── Base delay between words per tag ─────────────────────────────────────────
 
 _KZ_WORD_DELAY = {
@@ -1112,6 +1651,9 @@ def _run_kz_animation(prefix: str, plaintext: str, tag: str = "") -> None:
         return
 
     if _SKIP_ANIM.is_set():
+        if _tui_active:
+            vp_end = _tui_rows[0] - 2
+            sys.stdout.write(f"\033[{vp_end};1H\033[2K")
         sys.stdout.write(prefix)
         for i, (w, sty) in enumerate(tokens):
             sys.stdout.write(_kz_render(w, sty))
@@ -1124,15 +1666,22 @@ def _run_kz_animation(prefix: str, plaintext: str, tag: str = "") -> None:
     WAVE = 4   # cipher window width per word (shorter than full-sentence wave)
     base_char_delay = _KZ_WORD_DELAY.get(tag, _KZ_WORD_DELAY["normal"]) * 0.35
 
-    # Save cursor once — we restore to here to redraw the whole line each frame
-    sys.stdout.write("\0337" + prefix)
-    sys.stdout.flush()
+    # In TUI mode use absolute row positioning; in plain mode use DECSC/DECRC.
+    if _tui_active:
+        _kz_vp_end = _tui_rows[0] - 2
+    else:
+        _kz_vp_end = None
+        sys.stdout.write("\0337" + prefix)
+        sys.stdout.flush()
 
     revealed: list = []   # list of (word, style) already shown
 
     def _redraw_line(word_placeholder: str = "") -> None:
-        """Restore saved cursor, rewrite prefix + revealed words + placeholder."""
-        sys.stdout.write("\0338" + RESET + prefix)
+        """Rewrite prefix + revealed words + placeholder at the correct row."""
+        if _kz_vp_end is not None:
+            sys.stdout.write(f"\033[{_kz_vp_end};1H\033[2K" + RESET + prefix)
+        else:
+            sys.stdout.write("\0338" + RESET + prefix)
         for i, (w, sty) in enumerate(revealed):
             sys.stdout.write(_kz_render(w, sty))
             sys.stdout.write(" ")
@@ -1210,7 +1759,10 @@ def _run_kz_animation(prefix: str, plaintext: str, tag: str = "") -> None:
                 elapsed += 0.02
 
     # Final clean write — full line with all emotion colors
-    sys.stdout.write("\0338" + RESET + prefix)
+    if _kz_vp_end is not None:
+        sys.stdout.write(f"\033[{_kz_vp_end};1H\033[2K" + RESET + prefix)
+    else:
+        sys.stdout.write("\0338" + RESET + prefix)
     for i, (word, style) in enumerate(_kz_tokenize(plaintext)):
         sys.stdout.write(_kz_render(word, style))
         if i < len(tokens) - 1:
@@ -1220,24 +1772,123 @@ def _run_kz_animation(prefix: str, plaintext: str, tag: str = "") -> None:
 
 
 
+def _kz_render_full(plaintext: str) -> str:
+    """
+    Render plaintext with KZ emotion colors applied to each word.
+    Returns a string with ANSI color codes — suitable for storing in _room_logs
+    so the TUI viewport always shows colored messages.
+    """
+    tokens = _kz_tokenize(plaintext)
+    if not tokens:
+        return plaintext
+    parts = []
+    for i, (w, sty) in enumerate(tokens):
+        parts.append(_kz_render(w, sty))
+        if i < len(tokens) - 1:
+            parts.append(" ")
+    parts.append(RESET)
+    return "".join(parts)
+
+
 def _animate_msg(prefix: str, plaintext: str, room: str,
                   from_user: str = "", ts: str = "",
                   tag: str = "") -> None:
-    """Run animation inside the output lock, log the final text, mark seen."""
-    _room_logs[room].append(prefix + plaintext)
+    """
+    Run cipher-wave animation then hand off to the background shimmer thread.
+
+    Lock discipline:
+      _OUTPUT_LOCK is held ONLY during the bounded cipher wave animation and
+      the final static write.  It is RELEASED before the shimmer starts.
+      The shimmer thread acquires the lock briefly (~2 ms) per frame.
+
+    Replay-burst detection:
+      _msg_queue_depth counts how many _animate_msg calls are waiting for the
+      lock right now.  If the depth is > 0 we are in a server replay or message
+      burst — skip the shimmer entirely (and optionally skip the cipher wave too)
+      so the backlog drains instantly instead of queuing up for seconds.
+    """
+    global _shimmer_thread, _msg_queue_depth, _shimmer_msg_rows
+
+    # Pre-build the KZ-colored version once — stored in _room_logs so the
+    # TUI viewport always redraws with emotion colors, not plain text.
+    colored_text = _kz_render_full(plaintext)
+    tokens = _kz_tokenize(plaintext)
+
+    # Log is appended AFTER animation so the message does not appear
+    # in the viewport while it is still being cipher-animated.
     if from_user and ts:
         mark_seen(room, from_user, ts, plaintext)
+
+    # ── 1. Signal queue depth and kill any active shimmer ─────────────────────
+    _msg_queue_depth += 1
+    _stop_shimmer()   # sets _SHIMMER_STOP, joins shimmer thread
+
+    # ── 2. Run the bounded cipher-wave animation (holds lock) ─────────────────
     with _OUTPUT_LOCK:
+        _msg_queue_depth = max(0, _msg_queue_depth - 1)
+        _SHIMMER_STOP.clear()   # we now own the terminal; shimmer is gone
+
         _erase_input_unsafe()
-        # Use KZ word animation when message has a tag or any word
-        # the engine would style (ALL CAPS, emotion words, @mentions etc).
-        # Fall back to cipher wave for plain untagged messages with no
-        # interesting words — keeps the original feel for simple chatter.
-        if tag or _has_kz_content(plaintext):
-            _run_kz_animation(prefix, plaintext, tag=tag)
+
+        # Auto-skip animation when the user is actively typing
+        if _g_buf:
+            trigger_skip_animation()
+
+        # Burst mode: if messages are still queued behind us, skip cipher wave
+        # entirely and just print static so the backlog clears instantly.
+        burst = _msg_queue_depth > 0
+
+        if burst or _SKIP_ANIM.is_set():
+            # Fast path — static print with emotion colors, no cipher wave
+            _room_logs[room].append(prefix + colored_text)
+            if _tui_active:
+                _tui_draw_viewport_unsafe()
+            else:
+                sys.stdout.write(prefix)
+                for i, (w, sty) in enumerate(tokens):
+                    sys.stdout.write(_kz_render(w, sty))
+                    if i < len(tokens) - 1:
+                        sys.stdout.write(" ")
+                sys.stdout.write(RESET + "\n")
+                sys.stdout.flush()
+            _redraw_input_unsafe()
+            return   # no shimmer in burst mode
+
+        # Compute shimmer row count before we decide where to animate
+        tw = (_tui_cols[0] if _tui_active else _get_tw()) or 80
+        visible_len = len(_strip_ansi(prefix)) + len(plaintext)
+        _shimmer_msg_rows = max(1, (visible_len + tw - 1) // tw)
+
+        if _tui_active:
+            # In TUI mode skip the per-character cipher wave entirely.
+            # The shimmer handles the gradient animation for any message length.
+            _room_logs[room].append(prefix + colored_text)
+            _tui_draw_viewport_unsafe()
         else:
-            _run_animation(prefix, plaintext)
+            # Plain mode — full cipher wave then log
+            if tag or _has_kz_content(plaintext):
+                _run_kz_animation(prefix, plaintext, tag=tag)
+            else:
+                _run_animation(prefix, plaintext)
+            _room_logs[room].append(prefix + colored_text)
+
         _redraw_input_unsafe()
+        # Lock released here — shimmer thread can now acquire it per-frame
+
+    # ── 3. Spawn background shimmer ─────────────────────────────────────────
+    # Works in both plain and TUI mode.  In TUI mode we pass tui_vp_end so
+    # _shimmer_bg uses absolute row positioning to rewrite just the last
+    # message row — it never touches the header, separator, or input bar.
+    # _stop_shimmer() is always called at the top of the next _animate_msg so
+    # there is no race: the shimmer is dead before any new message is drawn.
+    if not _SKIP_ANIM.is_set() and not _g_buf:
+        shimmer_vp_end = (_tui_rows[0] - 2) if _tui_active else None
+        _shimmer_thread = threading.Thread(
+            target=_shimmer_bg,
+            args=(prefix, plaintext, tokens, _shimmer_msg_rows, shimmer_vp_end, room),
+            daemon=True,
+        )
+        _shimmer_thread.start()
 
 
 def chat_decrypt_animation(
@@ -1262,7 +1913,10 @@ def chat_decrypt_animation(
     user_part  = colorize(from_user, color, bold=bold)
     badge_part = format_tag_badge(tag)
     prefix     = f"{ts_part} {user_part}: {badge_part}"
-    rendered   = prefix + plaintext
+    # Colored version (KZ emotion colors on words) — stored in _room_logs so
+    # the TUI viewport always redraws with colors.
+    colored_plain = _kz_render_full(plaintext)
+    rendered   = prefix + colored_plain
 
     # Already seen — reprint plain (no animation) so it shows in the room
     # after a screen clear / room switch.
@@ -1271,17 +1925,18 @@ def chat_decrypt_animation(
         print_msg(rendered)
         return
 
+    # Fire sound immediately — before animation so long messages don't delay the alert.
+    if from_user != own_username:
+        if tag and tag in TAGS:
+            play_notification(TAGS[tag]["sound"])
+        else:
+            play_notification("normal")
+
     if not anim_enabled or not _is_tty():
         log_and_print(room, rendered)
         mark_seen(room, from_user, msg_ts, plaintext)
     else:
         _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts, tag=tag)
-
-    # Play notification sound after printing (daemon thread — non-blocking)
-    if tag and tag in TAGS and from_user != own_username:
-        play_notification(TAGS[tag]["sound"])
-    elif not tag and from_user != own_username:
-        play_notification("normal")
 
 
 def privmsg_decrypt_animation(
@@ -1299,23 +1954,24 @@ def privmsg_decrypt_animation(
     sig_part  = cok("✓") if verified else cwarn("?")
     badge_part = format_tag_badge(tag)
     prefix    = f"{ts_part} {src_part}{sig_part} {badge_part}"
-    rendered  = prefix + plaintext
+    colored_plain = _kz_render_full(plaintext)
+    rendered  = prefix + colored_plain
 
     if already_seen(room, from_user, msg_ts, plaintext):
         print_msg(rendered)   # replay — don't re-log, already in _room_logs
         return
+
+    # Fire sound immediately — before animation so long messages don't delay the alert.
+    if tag and tag in TAGS:
+        play_notification(TAGS[tag]["sound"])
+    else:
+        play_notification("info")   # PMs always ping
 
     if not anim_enabled or not _is_tty():
         log_and_print(room, rendered)
         mark_seen(room, from_user, msg_ts, plaintext)
     else:
         _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts, tag=tag)
-
-    # Play notification sound (always for PMs — they deserve attention)
-    if tag and tag in TAGS:
-        play_notification(TAGS[tag]["sound"])
-    else:
-        play_notification("info")   # PMs always ping
 
 
 # ---------------------------------------------------------------------------
@@ -1356,6 +2012,13 @@ def read_line_noecho() -> str:
         _g_buf          = []
         _g_cur          = 0
         _g_input_active = True
+        # In TUI mode the cursor may have drifted into the viewport after the
+        # last message / send.  Explicitly home it to the input row so the
+        # first character typed appears in the right place.
+        if _tui_active:
+            inp_row = _tui_rows[0]
+            sys.stdout.write(f"\033[{inp_row};1H\033[2K")
+            sys.stdout.flush()
 
     import os as _os, select as _sel
 
@@ -1400,8 +2063,11 @@ def read_line_noecho() -> str:
                     if _g_cur > 0:
                         _g_buf.pop(_g_cur - 1)
                         _g_cur -= 1
-                        sys.stdout.write("\033[D")   # move cursor left
-                        _inline_redraw()
+                        if _tui_active:
+                            _redraw_input_unsafe()
+                        else:
+                            sys.stdout.write("\033[D")
+                            _inline_redraw()
 
             elif ch == "\x1b":
                 r, _, _ = _sel.select([fd], [], [], 0.05)
@@ -1414,41 +2080,92 @@ def read_line_noecho() -> str:
                     if not r2:
                         continue
                     fin = _readbyte()
+                    if fin == "<" and _tui_active:
+                        # SGR extended mouse sequence: ESC[<btn;col;row{M|m}
+                        buf = ""
+                        while True:
+                            r3, _, _ = _sel.select([fd], [], [], 0.2)
+                            if not r3: break
+                            b = _readbyte()
+                            buf += b
+                            if b in ("M", "m"): break
+                        try:
+                            parts = buf[:-1].split(";")
+                            btn   = int(parts[0])
+                            final = buf[-1] if buf else ""
+                            if final == "M":        # press event
+                                if btn == 64:      # scroll wheel up
+                                    _tui_scroll(3)
+                                elif btn == 65:    # scroll wheel down
+                                    _tui_scroll(-3)
+                        except (ValueError, IndexError):
+                            pass
+                        continue
+                    # Handle scroll keys OUTSIDE the lock (_tui_scroll acquires it)
+                    _scroll_delta = 0
+                    if fin == "A" and _tui_active:       # Up arrow / wheel up
+                        _scroll_delta = 3
+                    elif fin == "B" and _tui_active:     # Down arrow / wheel down
+                        _scroll_delta = -3
+                    elif fin == "5":                     # PageUp
+                        r3,_,_ = _sel.select([fd],[],[],0.05)
+                        if r3: _readbyte()
+                        _scroll_delta = max(1, _tui_rows[0] - 4) if _tui_active else 0
+                        if not _tui_active:
+                            with _OUTPUT_LOCK:
+                                _erase_input_unsafe()
+                                room = _current_room[0]
+                                log  = _room_logs.get(room, [])
+                                if log:
+                                    lines = log[-30:]
+                                    sys.stdout.write(colorize(f"\n  \u2500\u2500 last {len(lines)} of {len(log)} messages \u2500\u2500\n","\033[90m"))
+                                    for ln in lines: print(ln)
+                                    sys.stdout.write("\n")
+                                    sys.stdout.flush()
+                                _redraw_input_unsafe()
+                    elif fin == "6":                     # PageDown
+                        r3,_,_ = _sel.select([fd],[],[],0.05)
+                        if r3: _readbyte()
+                        _scroll_delta = -(max(1, _tui_rows[0] - 4)) if _tui_active else 0
+
+                    if _scroll_delta != 0 and _tui_active:
+                        _tui_scroll(_scroll_delta)
+                        continue   # skip the lock block below for these keys
+
                     with _OUTPUT_LOCK:
                         if fin == "D":                # Left
                             if _g_cur > 0:
                                 _g_cur -= 1
-                                sys.stdout.write("\033[D")
-                                sys.stdout.flush()
+                                if _tui_active:
+                                    _redraw_input_unsafe()
+                                else:
+                                    sys.stdout.write("\033[D")
+                                    sys.stdout.flush()
                         elif fin == "C":              # Right
                             if _g_cur < len(_g_buf):
                                 _g_cur += 1
-                                sys.stdout.write("\033[C")
-                                sys.stdout.flush()
+                                if _tui_active:
+                                    _redraw_input_unsafe()
+                                else:
+                                    sys.stdout.write("\033[C")
+                                    sys.stdout.flush()
                         elif fin == "H":              # Home
                             if _g_cur > 0:
-                                sys.stdout.write(f"\033[{_g_cur}D")
                                 _g_cur = 0
-                                sys.stdout.flush()
+                                if _tui_active:
+                                    _redraw_input_unsafe()
+                                else:
+                                    sys.stdout.write(f"\033[{_g_cur}D")
+                                    sys.stdout.flush()
                         elif fin == "F":              # End
-                            trail = len(_g_buf) - _g_cur
-                            if trail > 0:
-                                sys.stdout.write(f"\033[{trail}C")
+                            if _g_cur < len(_g_buf):
                                 _g_cur = len(_g_buf)
-                                sys.stdout.flush()
-                        elif fin == "5":        # PageUp = ESC[5~
-                            r3,_,_ = _sel.select([fd],[],[],0.05)
-                            if r3: _readbyte()  # consume trailing ~
-                            _erase_input_unsafe()
-                            room = _current_room[0]
-                            log  = _room_logs.get(room, [])
-                            if log:
-                                lines = log[-30:]
-                                sys.stdout.write(colorize(f"\n  \u2500\u2500 last {len(lines)} of {len(log)} messages \u2500\u2500\n","\033[90m"))
-                                for ln in lines: print(ln)
-                                sys.stdout.write("\n")
-                                sys.stdout.flush()
-                            _redraw_input_unsafe()
+                                if _tui_active:
+                                    _redraw_input_unsafe()
+                                else:
+                                    trail = len(_g_buf) - _g_cur
+                                    sys.stdout.write(f"\033[{trail}C")
+                                    sys.stdout.flush()
                         elif not (fin.isalpha() or fin == "~"):
                             # Extended sequence — drain until terminator
                             while True:
@@ -1456,18 +2173,32 @@ def read_line_noecho() -> str:
                                 if not r3: break
                                 b = _readbyte()
                                 if b.isalpha() or b == "~": break
-                        # Up/Down/F-keys — fin consumed, ignore
+                        # Other alpha keys (F-keys etc) — consumed, ignore
 
             elif ch >= " ":
                 with _OUTPUT_LOCK:
                     _g_buf.insert(_g_cur, ch)
                     _g_cur += 1
-                    if _g_cur == len(_g_buf):
+                    if _tui_active:
+                        # Always use _redraw_input_unsafe in TUI so the
+                        # windowed display is applied — prevents long input
+                        # from wrapping into the message / separator rows.
+                        _redraw_input_unsafe()
+                    elif _g_cur == len(_g_buf):
                         sys.stdout.write(ch)
                         sys.stdout.flush()
                     else:
                         sys.stdout.write(ch)
                         _inline_redraw()
+            # ── Resize check after every keystroke ───────────────────────────
+            if _resize_pending[0] and _tui_active:
+                _resize_pending[0] = False
+                with _OUTPUT_LOCK:
+                    _tui_size()            # must happen before redraw
+                    # Re-assert scroll region with new dimensions then full redraw
+                    rows2, cols2, vs, ve, sr, ir = _tui_layout()
+                    sys.stdout.write(f"\033[{vs};{ve}r")  # reset scroll region
+                    _tui_full_redraw_unsafe()
 
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)

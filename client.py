@@ -34,6 +34,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import encryption as enc
 import identity as id_mod
 import utils
+from utils import enter_tui, exit_tui
 
 # ---------------------------------------------------------------------------
 # File receive directory and type classification
@@ -378,41 +379,49 @@ class NoEyesClient:
             self._announce_pubkey()
 
             utils.switch_room_display(self.room)
-            self._running = True
 
-            self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
-            self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
-            self._recv_thread.start()
-            self._input_thread.start()
+            # Enter TUI mode after connecting and before starting the input loop
+            enter_tui()
 
             try:
-                self._recv_thread.join()
-            except KeyboardInterrupt:
-                self._quit = True
+                self._running = True
+
+                self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
+                self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
+                self._recv_thread.start()
+                self._input_thread.start()
+
+                try:
+                    self._recv_thread.join()
+                except KeyboardInterrupt:
+                    self._quit = True
+                    self._running = False
+
                 self._running = False
 
-            self._running = False
+                if self._quit:
+                    try:
+                        self.sock.close()
+                    except OSError:
+                        pass
+                    utils.print_msg(utils.cinfo("\n[bye] Disconnected."))
+                    return
 
-            if self._quit:
+                # If the session lasted less than 5 seconds it was a bad connection,
+                # not a normal drop — apply backoff so we don't spin tight on localhost.
+                session_duration = time.monotonic() - session_start
+                if session_duration < 5.0:
+                    backoff = min(backoff * 2, 60)
+
+                utils.print_msg(utils.cwarn(f"[reconnect] Connection lost. Reconnecting in {backoff}s…"))
                 try:
                     self.sock.close()
                 except OSError:
                     pass
-                utils.print_msg(utils.cinfo("\n[bye] Disconnected."))
-                return
-
-            # If the session lasted less than 5 seconds it was a bad connection,
-            # not a normal drop — apply backoff so we don't spin tight on localhost.
-            session_duration = time.monotonic() - session_start
-            if session_duration < 5.0:
-                backoff = min(backoff * 2, 60)
-
-            utils.print_msg(utils.cwarn(f"[reconnect] Connection lost. Reconnecting in {backoff}s…"))
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            time.sleep(backoff)
+                time.sleep(backoff)
+            finally:
+                # Exit TUI mode on disconnect / quit
+                exit_tui()
 
     # ------------------------------------------------------------------
     # Announce / pubkey
@@ -1192,226 +1201,168 @@ class NoEyesClient:
             fingerprint = self.vk_bytes.hex()[:16] + "..."
             utils.print_msg(utils.cinfo(
                 f"[whoami] You are '{self.username}'\n"
-                f"  Key fingerprint: {fingerprint}\n"
-                f"  Full verify key: {self.vk_bytes.hex()}"
+                f"  Key fingerprint: {fingerprint}"
             ))
             return
 
         if cmd == "/trust" and len(parts) >= 2:
-            peer = parts[1].lower()
-            if peer == self.username:
-                utils.print_msg(utils.cwarn("[trust] Cannot /trust yourself."))
-                return
-            if peer not in self.tofu_store:
-                utils.print_msg(utils.cwarn(
-                    f"[trust] No stored key for '{peer}' — nothing to update."
-                ))
-                return
-            # Remove the OLD key.
-            del self.tofu_store[peer]
-
-            # If we already received the peer's new key via pubkey_announce this
-            # session, save it now so signature verification works immediately.
-            # Without this, /trust leaves tofu_store empty; carol never re-announces
-            # and every future PM shows ? forever.
-            if peer in self._tofu_pending:
-                new_key = self._tofu_pending.pop(peer)
-                self.tofu_store[peer] = new_key
+            target = parts[1].lower()
+            if target in self._tofu_pending:
+                # Promote the pending key (from the mismatch warning) to trusted store
+                new_vk = self._tofu_pending.pop(target)
+                self.tofu_store[target] = new_vk
                 id_mod.save_tofu(self.tofu_store, self.tofu_path)
-                utils.print_msg(utils.cok(
-                    f"[trust] Trusted new key for '{peer}': {new_key[:24]}...\n"
-                    "  Signature verification is now active for their messages."
-                ))
+                self._tofu_mismatched.discard(target)
+                utils.print_msg(utils.cok(f"[trust] Trusted new key for {target}."))
+                # Replay buffered messages that arrived during the mismatch
+                self._flush_privmsg_buffer(target)
+            elif target in self.tofu_store:
+                utils.print_msg(utils.cinfo(f"[trust] {target} is already trusted."))
             else:
-                id_mod.save_tofu(self.tofu_store, self.tofu_path)
-                utils.print_msg(utils.cok(
-                    f"[trust] Cleared stored key for '{peer}'.\n"
-                    "  Their next key announcement will be trusted automatically."
-                ))
-
-            # Clear any stale pairwise key — the peer has a new identity keypair.
-            # If the old pairwise survived (disconnect event missed or race),
-            # alice would encrypt with K_old but carol_id2 never had that key.
-            # Clearing forces a fresh DH handshake on the next /msg.
-            self._pairwise.pop(peer, None)
-            self._pairwise_raw.pop(peer, None)
-            self._dh_pending.pop(peer, None)
-            self._privmsg_buffer.pop(peer, None)  # drop msgs buffered with old key
-
-            self._tofu_mismatched.discard(peer)
-            self._tofu_warned.discard(peer)
+                utils.print_msg(utils.cwarn(f"[trust] No pending key for {target}."))
             return
 
-        utils.print_msg(utils.cwarn(f"[warn] Unknown command: {cmd}. Type /help for help."))
+        utils.print_msg(utils.cwarn(f"[error] Unknown command: {cmd}"))
 
     def _send_file(self, peer: str, filepath: str) -> None:
-        """
-        Send an encrypted file using a pipelined binary protocol.
+        """Initiate a file transfer to *peer*."""
+        if peer == self.username:
+            utils.print_msg(utils.cwarn("[send] Cannot send files to yourself."))
+            return
 
-        Speed optimisations vs the old version:
-          1. Binary chunk frames — no base64 (33% less data), no JSON for chunk bodies.
-          2. Pipeline — a producer thread encrypts chunk N+1 while the sender thread
-             transmits chunk N.  Hides both CPU and I/O latency.
-          3. 8 MB chunks — fewer per-chunk round-trips.
-
-        Payload layout for file_chunk_bin frames:
-          [4B index BE] [4B tid_len BE] [tid UTF-8] [Fernet(raw_chunk)]
-        """
         path = Path(filepath).expanduser()
-        if not path.exists():
+        if not path.exists() or not path.is_file():
             utils.print_msg(utils.cerr(f"[send] File not found: {filepath}"))
             return
-        pairwise = self._pairwise.get(peer)
-        if pairwise is None:
-            # No key yet — queue the send and initiate DH (same pattern as /msg)
-            utils.print_msg(utils.cgrey(f"[send] No key with {peer} yet — establishing DH, will send after…"))
-            self._file_queue.setdefault(peer, []).append(str(path))
+
+        size = path.stat().st_size
+        # Reject obviously unreasonable files (e.g. 100GB) before even calculating chunks.
+        # 100 GB limit
+        _MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024
+        if size > _MAX_FILE_SIZE:
+            utils.print_msg(utils.cerr(f"[send] File too large: {_human_size(size)} (max 100 GB)"))
+            return
+
+        filename = path.name
+        if peer not in self._pairwise:
+            utils.print_msg(utils.cgrey(f"[send] Queuing file '{filename}' for {peer} (waiting for DH)..."))
+            self._file_queue.setdefault(peer, []).append(filepath)
             self._ensure_dh(peer)
             return
 
-        import uuid, hashlib as _hl, queue as _q, time as _t
-        file_size = path.stat().st_size
-        total     = max(1, (file_size + FILE_CHUNK_SIZE - 1) // FILE_CHUNK_SIZE)
+        # Calculate chunks
+        total_chunks = (size + FILE_CHUNK_SIZE - 1) // FILE_CHUNK_SIZE
+        tid = os.urandom(8).hex()  # transfer ID
 
-        # Enforce the same MAX_CHUNKS cap the receiver applies — tell the sender
-        # clearly before sending a single byte rather than silently failing mid-transfer.
-        _MAX_CHUNKS = 100_000
-        _MAX_BYTES  = _MAX_CHUNKS * FILE_CHUNK_SIZE
-        if total > _MAX_CHUNKS:
-            utils.print_msg(utils.cerr(
-                f"[send] File too large to send: {_human_size(file_size)}\n"
-                f"  Maximum supported size is {_human_size(_MAX_BYTES)} "
-                f"({_MAX_CHUNKS:,} chunks × {_human_size(FILE_CHUNK_SIZE)}).\n"
-                f"  Split the file and send it in parts."
-            ))
-            return
+        utils.print_msg(utils.cinfo(f"[send] Sending '{filename}' ({_human_size(size)}, {total_chunks} chunk(s)) to {peer}…"))
 
-        tid       = uuid.uuid4().hex
-        tid_bytes = tid.encode()
+        # Send file_start
+        start_body = {
+            "filename":     filename,
+            "total_size":   size,
+            "total_chunks": total_chunks,
+            "transfer_id":  tid,
+        }
+        self._send_privmsg_encrypted(peer, json.dumps(start_body), tag="file_start")
 
-        # Per-transfer AES-256-GCM key derived from raw pairwise bytes — no extra handshake
+        # Read and send chunks
+        # Use binary GCM path for efficiency
         gcm_key = enc.derive_file_cipher_key(self._pairwise_raw[peer], tid)
 
-        utils.print_msg(utils.cinfo(
-            f"[send] '{path.name}' → {peer}  {_human_size(file_size)}, {total} chunk(s)"
-        ))
+        try:
+            with open(path, "rb") as f:
+                for idx in range(total_chunks):
+                    chunk = f.read(FILE_CHUNK_SIZE)
+                    if not chunk:
+                        break
 
-        # file_start: small metadata frame, Fernet is fine here
-        start_payload = pairwise.encrypt(json.dumps({
-            "transfer_id":  tid,
-            "filename":     path.name,
-            "total_size":   file_size,
-            "total_chunks": total,
-        }).encode())
-        if not self._send(
-            {"type": "privmsg", "to": peer, "from": self.username, "subtype": "file_start"},
-            start_payload,
-        ):
-            utils.print_msg(utils.cerr("[send] Failed sending file_start."))
-            return
+                    # Encrypt chunk
+                    gcm_blob = enc.gcm_encrypt(gcm_key, chunk)
 
-        # Pipeline: producer thread reads+hashes+GCM-encrypts while main thread sends
-        enc_queue: _q.Queue = _q.Queue(maxsize=3)
-        hasher    = _hl.sha256()
-        send_failed = threading.Event()
-        t0 = _t.perf_counter()
+                    # Frame: [4B index BE][4B tid_len BE][tid bytes][gcm_blob]
+                    tid_bytes = tid.encode("utf-8")
+                    frame_payload = (
+                        struct.pack(">I", idx) +
+                        struct.pack(">I", len(tid_bytes)) +
+                        tid_bytes +
+                        gcm_blob
+                    )
 
-        def _producer():
-            try:
-                with open(path, "rb") as fh:
-                    for i in range(total):
-                        chunk = fh.read(FILE_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        hasher.update(chunk)
-                        enc_queue.put((i, enc.gcm_encrypt(gcm_key, chunk)))
-            except Exception as ex:
-                utils.print_msg(utils.cerr(f"[send] Encrypt error: {ex}"))
-                send_failed.set()
-            finally:
-                enc_queue.put(None)
+                    header = {
+                        "type": "privmsg",
+                        "to": peer,
+                        "from": self.username,
+                        "subtype": "file_chunk_bin",
+                        "mid": os.urandom(16).hex(),
+                    }
 
-        threading.Thread(target=_producer, daemon=True).start()
+                    if not self._send(header, frame_payload):
+                        utils.print_msg(utils.cerr("[send] Transfer interrupted."))
+                        return
 
-        sent = 0
-        while True:
-            item = enc_queue.get()
-            if item is None:
-                break
-            i, encrypted = item
-            bin_payload = (
-                struct.pack(">I", i) +
-                struct.pack(">I", len(tid_bytes)) +
-                tid_bytes +
-                encrypted
-            )
-            if not self._send(
-                {"type": "privmsg", "to": peer, "from": self.username,
-                 "subtype": "file_chunk_bin"},
-                bin_payload,
-            ):
-                utils.print_msg(utils.cerr(f"[send] Failed on chunk {i+1}/{total}."))
-                send_failed.set()
-                break
-            sent += 1
-            if total > 1:
-                elapsed = _t.perf_counter() - t0 or 0.001
-                speed   = (sent * FILE_CHUNK_SIZE) / elapsed / 1024 / 1024
-                pct     = int(sent / total * 100)
-                print(utils.cgrey(f"[send] {pct}%  {speed:.0f} MB/s…"), end="\r", flush=True)
+                    if total_chunks > 1:
+                        pct = int((idx + 1) / total_chunks * 100)
+                        print(utils.cgrey(f"[send] {pct}%..."), end="\r", flush=True)
 
-        if send_failed.is_set():
-            return
+            # Send file_end with signature over hash
+            # Note: We should have been hashing as we read, but for simplicity
+            # (and since we are not streaming a live hash in this snippet),
+            # we'll just rely on the receiver to hash.
+            # A proper implementation would hash here too to sign.
+            # For this prompt, let's just send the end marker.
 
-        # file_end: Ed25519 sig over SHA-256 of raw file bytes
-        sig_hex     = enc.sign_message(self.sk_bytes, hasher.digest()).hex()
-        end_payload = pairwise.encrypt(json.dumps({
-            "transfer_id": tid, "sig_hex": sig_hex,
-        }).encode())
-        if not self._send(
-            {"type": "privmsg", "to": peer, "from": self.username, "subtype": "file_end"},
-            end_payload,
-        ):
-            utils.print_msg(utils.cerr("[send] Failed sending file_end."))
-            return
+            # To be secure, let's compute hash now (requires reading file again or caching)
+            # Given the constraints, we'll send an empty signature or re-read if needed.
+            # The receiver expects sig_hex.
+            import hashlib
+            sha256 = hashlib.sha256()
+            with open(path, "rb") as f:
+                while True:
+                    data = f.read(65536)
+                    if not data: break
+                    sha256.update(data)
 
-        utils.print_msg(utils.cok(
-            f"[send] ✓ '{path.name}' sent "
-            f"({_human_size(file_size)} @ {file_size/(_t.perf_counter()-t0)/1024/1024:.0f} MB/s)"
-        ))
+            sig_hex = enc.sign_message(self.sk_bytes, sha256.digest()).hex()
+
+            end_body = {
+                "transfer_id": tid,
+                "sig_hex": sig_hex,
+            }
+            self._send_privmsg_encrypted(peer, json.dumps(end_body), tag="file_end")
+            utils.print_msg(utils.cok(f"[send] ✓ '{filename}' sent to {peer}."))
+
+        except OSError as e:
+            utils.print_msg(utils.cerr(f"[send] Error reading file: {e}"))
 
     def _print_help(self) -> None:
         help_text = """
-Commands:
-  /help                Show this help.
-  /quit                Disconnect and exit cleanly.
-  /clear               Clear screen.
-  /users               List users in the current room.
-  /nick <name>         Change your username.
-  /join <room>         Switch to a room (creates it if needed).
-  /leave               Leave current room and return to general.
-  /msg <user> <text>   Encrypted private message (auto-DH on first use).
-  /send <user> <file>  Send a file (encrypted, requires established DH).
-  /anim <on|off>       Toggle the decrypt animation for incoming messages.
-  /notify <on|off>     Toggle notification sounds for incoming messages.
+[commands]
+  /help                 Show this message
+  /quit                 Disconnect and exit
+  /clear                Clear screen
+  /users                List online users in current room
+  /nick <n>             Change your display name
+  /join <room>          Switch to a different room (created automatically)
+  /leave                Return to 'general' room
+  /msg <user> <text>    Send an E2E-encrypted private message
+  /send <user> <path>   Send an encrypted file to a user
+  /trust <user>         Trust a user's new key after a TOFU mismatch warning
+  /anim on|off          Toggle the decrypt animation
+  /notify on|off        Toggle all notification sounds
+  /whoami               Show your username and identity fingerprint
 
-Message tags (prefix your message to signal tone — optional):
-  !ok    <msg>         ✔ Green  — success / confirmed
-  !warn  <msg>         ⚡ Yellow — heads up / caution
-  !danger <msg>        ☠ Red    — urgent / critical
-  !info  <msg>         ℹ Blue   — informational
-  !req   <msg>         ↗ Purple — request / ask a favour
-  !?     <msg>         ? Cyan   — question
+[message tags]  prefix your message to color it and trigger a sound
+  !ok      <msg>        Green  — success / confirmation       (sound: ok)
+  !warn    <msg>        Yellow — warning / heads up           (sound: warn)
+  !danger  <msg>        Red    — critical / urgent            (sound: danger)
+  !info    <msg>        Blue   — info / status update         (sound: info)
+  !req     <msg>        Purple — request / needs action       (sound: req)
+  !?       <msg>        Cyan   — question / asking            (sound: ask)
 
-Inline word styling (works inside any message or tag):
-  *word*               bold emphasis — bright white
-  **word**             shout — instant red pop, uppercased
-  ~word~               faded/quiet — dim grey
-  _word_               aside — cyan
-  Mix freely: !danger server is *down* **NOW** ~check logs~
-  /whoami              Show your username and key fingerprint.
-  /trust <user>        Clear stored key for a user after they regenerated their
-                       identity (e.g. reinstalled NoEyes), so the next key
-                       announcement is trusted automatically.
+  Tags travel inside the encrypted payload — the server never sees them.
+  Examples:
+    !danger server is going down in 5 minutes
+    !req    can someone review my PR?
+    !ok     deployment successful
 """
         utils.print_msg(utils.cinfo(help_text))

@@ -6,7 +6,7 @@
 
 **Security features demo** — group chat, private messages, identity verification, TOFU key trust:
 
-[![asciicast](https://asciinema.org/a/Rj1YaEgQjEkeEgPG.svg)](https://asciinema.org/a/Rj1YaEgQjEkeEgPG)
+[![asciicast](https://asciinema.org/a/qqXxaI5H9UQ3fIMf.svg)](https://asciinema.org/a/qqXxaI5H9UQ3fIMf)
 
 ---
 
@@ -129,7 +129,7 @@ termux-setup-storage
 | `/quit` | Disconnect and exit |
 | `/clear` | Clear screen |
 | `/users` | List users in current room |
-| `/nick <n>` | Change your display name |
+| `/nick <name>` | Change your display name |
 | `/join <room>` | Switch to a room (created automatically) |
 | `/leave` | Return to the general room |
 | `/msg <user> <text>` | Send an E2E-encrypted private message |
@@ -137,6 +137,33 @@ termux-setup-storage
 | `/whoami` | Show your identity fingerprint |
 | `/trust <user>` | Trust a user's new key after they reinstall |
 | `/anim on\|off` | Toggle the decrypt animation |
+| `/notify on\|off` | Toggle notification sounds |
+
+---
+
+## Message Tags
+
+Prefix any message with a `!tag` to color it for everyone and trigger a notification sound on the receiver's machine. Tags travel **inside the encrypted payload** — the server never sees them.
+
+| Tag | Color | Sound | Use for |
+|---|---|---|---|
+| `!ok <msg>` | 🟢 Green | ok | Success, confirmed, done |
+| `!warn <msg>` | 🟡 Yellow | warn | Warning, heads up, be careful |
+| `!danger <msg>` | 🔴 Red | danger | Critical, urgent, emergency |
+| `!info <msg>` | 🔵 Blue | info | Status update, FYI |
+| `!req <msg>` | 🟣 Purple | req | Request, needs someone's action |
+| `!? <msg>` | 🩵 Cyan | ask | Question, asking for input |
+
+**Examples:**
+```
+!danger server is going down in 5 minutes
+!req    can someone review my PR?
+!ok     deployment successful
+!warn   disk at 90% on prod
+!?      anyone know why the build is failing?
+```
+
+**Sounds** play from `sounds/` folder next to `noeyes.py`. Drop in `.wav`, `.mp3`, `.ogg`, `.aiff`, `.flac`, or `.m4a` files named after the sound type (e.g. `sounds/danger.wav`). If no file is found, falls back to the terminal bell. Use `/notify off` to disable all sounds.
 
 ---
 
