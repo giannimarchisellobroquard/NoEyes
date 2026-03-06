@@ -57,6 +57,10 @@ TOOL_FILES = [
     "selftest_demo2.py",
     # docs
     "README.md", "CHANGELOG.md", "requirements.txt", ".gitignore",
+    # sfx
+    "sfx/diskette.mp3",
+    "sfx/crt.mp3",
+    "sfx/logo.mp3",
 ]
 
 PROTECTED = {
@@ -225,6 +229,7 @@ def cmd_update(force=False):
                 if not src.exists():
                     continue
                 if dest.exists():
+                    (backup / f).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(dest, backup / f)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dest)
