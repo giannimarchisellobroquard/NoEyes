@@ -53,7 +53,7 @@ _TYPE_MAP = {
                ".pptx", ".ppt", ".csv", ".odt", ".rtf", ".pages"},
 }
 
-FILE_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB — sweet spot for AES-GCM throughput
+FILE_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB — 1 frame per 5MB file, fastest over bore tunnels
 # Chunks use AES-256-GCM (hardware-accelerated, ~800 MB/s) not Fernet (~90 MB/s).
 # Binary frame: [4B index BE][4B tid_len BE][tid bytes][nonce(12)+ct+tag(16)]
 
@@ -263,6 +263,7 @@ class NoEyesClient:
         """
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.connect((self.host, self.port))
             if self._tls:
                 import ssl as _ssl
@@ -810,14 +811,28 @@ class NoEyesClient:
             utils.print_msg(utils.cwarn(f"[msg] Could not decrypt message from {from_user}."))
             return
 
-        subtype = header.get("subtype", "text")
+        # subtype may be in the header (future) or inside the encrypted body as "tag"
+        # We check body first so file transfers never leak type to the server.
+        subtype = header.get("subtype") or body.get("tag", "text")
 
-        if subtype == "file_start":
-            self._handle_file_start(from_user, body)
-        elif subtype == "file_chunk":
-            self._handle_file_chunk(from_user, body)
-        elif subtype == "file_end":
-            self._handle_file_end(from_user, body, ts)
+        if subtype in ("file_start", "file_chunk", "file_end"):
+            # Sender wraps metadata as json.dumps(meta_dict) in body["text"].
+            # Unwrap it so handlers can access fields directly.
+            inner = body.get("text", "")
+            if isinstance(inner, str) and inner.startswith("{"):
+                try:
+                    file_body = json.loads(inner)
+                except json.JSONDecodeError:
+                    file_body = body
+            else:
+                file_body = body
+
+            if subtype == "file_start":
+                self._handle_file_start(from_user, file_body)
+            elif subtype == "file_chunk":
+                self._handle_file_chunk(from_user, file_body)
+            elif subtype == "file_end":
+                self._handle_file_end(from_user, file_body, ts)
         else:
             # Plain text message
             text    = body.get("text", "")
@@ -945,7 +960,7 @@ class NoEyesClient:
             meta["next_index"] += 1
         if meta["total_chunks"] > 1:
             pct = int(meta["received"] / meta["total_chunks"] * 100)
-            print(utils.cgrey(f"[recv] {pct}%..."), end="\r", flush=True)
+            utils.print_msg(utils.cgrey(f"[recv] {pct}%..."))
 
     def _handle_file_chunk(self, from_user: str, body: dict) -> None:
         # Legacy JSON/base64 path (kept for compatibility)
@@ -1193,7 +1208,10 @@ class NoEyesClient:
         if cmd == "/send" and len(parts) >= 3:
             peer     = parts[1].lower()
             filepath = parts[2]
-            self._send_file(peer, filepath)
+            # Run in background thread — never blocks the input loop
+            threading.Thread(
+                target=self._send_file, args=(peer, filepath), daemon=True
+            ).start()
             return
 
         if cmd == "/whoami":
@@ -1269,6 +1287,10 @@ class NoEyesClient:
         # Use binary GCM path for efficiency
         gcm_key = enc.derive_file_cipher_key(self._pairwise_raw[peer], tid)
 
+        import hashlib as _hl
+        sha256 = _hl.sha256()
+        tid_bytes = tid.encode("utf-8")
+
         try:
             with open(path, "rb") as f:
                 for idx in range(total_chunks):
@@ -1276,58 +1298,34 @@ class NoEyesClient:
                     if not chunk:
                         break
 
-                    # Encrypt chunk
-                    gcm_blob = enc.gcm_encrypt(gcm_key, chunk)
+                    # Hash as we go — no second file read needed
+                    sha256.update(chunk)
 
-                    # Frame: [4B index BE][4B tid_len BE][tid bytes][gcm_blob]
-                    tid_bytes = tid.encode("utf-8")
+                    gcm_blob = enc.gcm_encrypt(gcm_key, chunk)
                     frame_payload = (
                         struct.pack(">I", idx) +
                         struct.pack(">I", len(tid_bytes)) +
                         tid_bytes +
                         gcm_blob
                     )
-
                     header = {
-                        "type": "privmsg",
-                        "to": peer,
-                        "from": self.username,
+                        "type":    "privmsg",
+                        "to":      peer,
+                        "from":    self.username,
                         "subtype": "file_chunk_bin",
-                        "mid": os.urandom(16).hex(),
+                        "mid":     os.urandom(16).hex(),
                     }
-
                     if not self._send(header, frame_payload):
                         utils.print_msg(utils.cerr("[send] Transfer interrupted."))
                         return
 
                     if total_chunks > 1:
                         pct = int((idx + 1) / total_chunks * 100)
-                        print(utils.cgrey(f"[send] {pct}%..."), end="\r", flush=True)
+                        utils.print_msg(utils.cgrey(f"[send] {pct}%..."))
 
-            # Send file_end with signature over hash
-            # Note: We should have been hashing as we read, but for simplicity
-            # (and since we are not streaming a live hash in this snippet),
-            # we'll just rely on the receiver to hash.
-            # A proper implementation would hash here too to sign.
-            # For this prompt, let's just send the end marker.
-
-            # To be secure, let's compute hash now (requires reading file again or caching)
-            # Given the constraints, we'll send an empty signature or re-read if needed.
-            # The receiver expects sig_hex.
-            import hashlib
-            sha256 = hashlib.sha256()
-            with open(path, "rb") as f:
-                while True:
-                    data = f.read(65536)
-                    if not data: break
-                    sha256.update(data)
-
-            sig_hex = enc.sign_message(self.sk_bytes, sha256.digest()).hex()
-
-            end_body = {
-                "transfer_id": tid,
-                "sig_hex": sig_hex,
-            }
+            # Sign the hash we computed inline — no second file read
+            sig_hex  = enc.sign_message(self.sk_bytes, sha256.digest()).hex()
+            end_body = {"transfer_id": tid, "sig_hex": sig_hex}
             self._send_privmsg_encrypted(peer, json.dumps(end_body), tag="file_end")
             utils.print_msg(utils.cok(f"[send] ✓ '{filename}' sent to {peer}."))
 

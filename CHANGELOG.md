@@ -1,53 +1,45 @@
 # FILE: CHANGELOG.md
 # Changelog
 
-## [2.0.0] — Blind-Forwarder E2E Encryption Upgrade
+## [v0.3.1] — File Transfer Fixes
 
-### Summary
-This release makes NoEyes a true end-to-end encrypted chat system. The server
-is now a **blind forwarder** — it routes messages by reading only the plaintext
-header JSON and forwards the encrypted payload bytes verbatim, never decrypting
-them.
+### Bug Fixes
 
-### Breaking changes
-- The wire protocol header format changes from a simple newline-delimited
-  encrypted blob to the framed format:
-  `[4-byte header_len BE] [4-byte payload_len BE] [header JSON] [payload bytes]`
-  Clients older than this release are **not** compatible and must be updated.
+#### File transfer not working (receiver side)
+- Receiver was displaying raw JSON instead of processing file transfer frames.
+  `_handle_privmsg` read `subtype` from the unencrypted header, but the sender
+  puts it inside the encrypted body as `tag`. Fixed: receiver now checks
+  `body.get("tag")` after decryption as fallback.
+- Receiver got `filename=unknown, size=0` because `_handle_file_start` was
+  reading fields from the outer Fernet body dict instead of the inner JSON
+  string in `body["text"]`. Fixed: inner JSON is now unwrapped before dispatch.
 
-### New features
+#### File transfer silently dropped mid-transfer
+- Server's privmsg rate limiter (25/15min per pair) was counting binary chunk
+  frames, causing all chunks beyond the limit to be silently dropped.
+  Fixed: `file_chunk_bin` frames are now exempt from the per-pair rate limiter.
 
-#### Server
-- **Zero decryption**: all calls to `Fernet.decrypt`, `fernet.decrypt`, and
-  any private-key primitives have been removed from `server.py`.
-- **Pubkey announcement store**: when a client announces its Ed25519 verify
-  key (`pubkey_announce` header), the server stores only the hex string in
-  memory and rebroadcasts it to room members so they can populate their TOFU
-  stores.  The server never holds private keys.
-- **DH routing**: `dh_init` and `dh_resp` frames are forwarded point-to-point
-  to the `to` header field recipient without inspection of the payload.
+#### UI freezing during file send
+- `_send_file` was called directly from the input thread, blocking all input
+  and output for the entire transfer duration.
+  Fixed: file sends now run in a background daemon thread.
 
-#### Client / Crypto
-- **Ed25519 identity** (`~/.noeyes/identity.key`): auto-generated on first
-  run.  Every private message payload is signed with the sender's Ed25519
-  signing key.  Recipients verify the signature against their TOFU store.
-- **X25519 DH handshake**: sending `/msg user text` when no pairwise key
-  exists triggers a DH handshake.  The DH public keys are carried inside
-  group-Fernet-encrypted payloads so the server cannot read them.  Once the
-  handshake completes the original message is re-sent automatically.
-- **Pairwise Fernet**: derived from the X25519 shared secret via SHA-256.
-  All `/msg` payloads are encrypted with this key.
-- **TOFU store** (`~/.noeyes/tofu_pubkeys.json`): first-seen pubkeys are
-  trusted and persisted; subsequent appearances are verified; mismatches
-  produce a loud security warning.
-- **`--gen-key`**: new CLI flag to generate a Fernet key file and exit.
+#### Progress display corruption
+- Bare `print(..., end="\r")` calls bypassed the TUI lock, producing garbled
+  backwards progress numbers racing with animation redraws.
+  Fixed: progress uses `utils.print_msg` through the output lock.
 
-#### Utilities
-- `identity.py` — new module: `load_tofu`, `save_tofu`, `trust_or_verify`,
-  `export_tofu`, `import_tofu`.
-- `encryption.py` — extended with: `generate_identity`, `load_identity`,
-  `save_identity`, `sign_message`, `verify_signature`, `dh_generate_keypair`,
-  `dh_derive_shared_fernet`.
+#### Double file read on send
+- SHA-256 hash for the Ed25519 signature was computed in a second full file
+  read after all chunks were sent. Fixed: hash is computed inline while
+  reading chunks, eliminating the redundant disk I/O.
 
-### Testing
-- `selftest.py` — automated acceptance test; run with `python selftest.py`.
+#### Slower transfers after chunk size change
+- Chunk size was incorrectly reduced to 512KB, turning a 1-frame transfer
+  into 11 frames. Each frame adds bore tunnel relay latency.
+  Reverted to 32MB chunks — 1 frame for files under 32MB.
+
+#### TCP latency
+- Added `TCP_NODELAY` on the client socket to disable Nagle's algorithm and
+  prevent artificial send delays on the tunnel.
+

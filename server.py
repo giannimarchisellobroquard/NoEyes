@@ -558,27 +558,31 @@ class NoEyesServer:
 
             if msg_type == "privmsg":
                 to_user = header.get("to", "")
-                # Server-side per-pair token bucket — clients cannot bypass this.
-                # Drain old timestamps, then check if under the limit.
-                pair   = (conn.username, to_user)
-                bucket = self._privmsg_pairs[pair]
-                now_ts = time.monotonic()
-                while bucket and (now_ts - bucket[0]) > PRIVMSG_PAIR_WINDOW:
-                    bucket.popleft()
-                if len(bucket) >= PRIVMSG_PAIR_LIMIT:
-                    logger.debug(
-                        "privmsg rate limit: %s → %s (%d/%d in %ds)",
-                        conn.username, to_user,
-                        len(bucket), PRIVMSG_PAIR_LIMIT, PRIVMSG_PAIR_WINDOW,
-                    )
-                    await conn.send({
-                        "type":    "system",
-                        "event":   "rate_limit",
-                        "message": f"Sending too fast to {to_user} — slow down.",
-                        "ts":      _now_ts(),
-                    })
-                    return
-                bucket.append(now_ts)
+                # Binary file chunks are exempt from the text rate limiter —
+                # they are already authenticated per-chunk with AES-256-GCM
+                # and a large file would be silently dropped mid-transfer otherwise.
+                is_file_chunk = header.get("subtype") == "file_chunk_bin"
+                if not is_file_chunk:
+                    # Server-side per-pair token bucket — clients cannot bypass this.
+                    pair   = (conn.username, to_user)
+                    bucket = self._privmsg_pairs[pair]
+                    now_ts = time.monotonic()
+                    while bucket and (now_ts - bucket[0]) > PRIVMSG_PAIR_WINDOW:
+                        bucket.popleft()
+                    if len(bucket) >= PRIVMSG_PAIR_LIMIT:
+                        logger.debug(
+                            "privmsg rate limit: %s → %s (%d/%d in %ds)",
+                            conn.username, to_user,
+                            len(bucket), PRIVMSG_PAIR_LIMIT, PRIVMSG_PAIR_WINDOW,
+                        )
+                        await conn.send({
+                            "type":    "system",
+                            "event":   "rate_limit",
+                            "message": f"Sending too fast to {to_user} — slow down.",
+                            "ts":      _now_ts(),
+                        })
+                        return
+                    bucket.append(now_ts)
                 await self._send_to_user(to_user, header, payload)
             else:
                 room = header.get("room", conn.room)
