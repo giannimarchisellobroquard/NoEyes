@@ -6,6 +6,11 @@
 
 **Security features demo** — group chat, private messages, identity verification, TOFU key trust:
 
+
+https://github.com/user-attachments/assets/c64bc1f9-352e-4d4d-88a3-66cec53adb4f
+
+
+
 [![asciicast](https://asciinema.org/a/qqXxaI5H9UQ3fIMf.svg)](https://asciinema.org/a/qqXxaI5H9UQ3fIMf)
 
 ---
