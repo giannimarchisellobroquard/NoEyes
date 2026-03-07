@@ -409,3 +409,9 @@ cat ~/.noeyes/tofu_pubkeys.json
 - **Networking:** Raw TCP sockets with a custom length-prefixed framing protocol
 - **Concurrency:** `threading` (recv + input threads per client), `asyncio` on the server
 - **Terminal:** ANSI escape codes, `termios` for raw keypress input
+
+---
+
+---
+
+Research & Educational Use Only — experimental project.
