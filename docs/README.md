@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/c64bc1f9-352e-4d4d-88a3-66cec53adb4f
 
 ---
 
-**Install demo 2 — `python setup.py`** (guided wizard):
+**Install demo 2 — `python ui/setup.py`** (guided wizard):
 
 [![asciicast](https://asciinema.org/a/33CtfifXVdPOsiVA.svg)](https://asciinema.org/a/33CtfifXVdPOsiVA)
 
@@ -48,6 +48,9 @@ NoEyes is a Python terminal chat tool for small groups who need real privacy. Un
 | **Ed25519 identity** | Auto-generated signing key — all private messages and files are signed |
 | **TOFU** | First-seen keys trusted; key mismatches trigger a visible security warning |
 | **Random PBKDF2 salt** | Each deployment gets a unique random salt — rainbow tables are useless |
+| **Split sidebar panel** | Rooms (top) and users (bottom) always visible side by side — each half scrolls independently |
+| **Free text selection** | No mouse capture — drag to copy text freely on all platforms including Termux |
+| **CRT boot animation** | Full-screen phosphor effect with sound on startup — works on all platforms |
 | **Guided launcher** | Arrow-key menu UI — no command-line experience needed |
 | **Auto dependency installer** | Detects your platform, installs what's missing, asks before changing anything |
 | **Self-updater** | One command to pull the latest version from GitHub |
@@ -60,13 +63,13 @@ NoEyes is a Python terminal chat tool for small groups who need real privacy. Un
 
 ```bash
 # 1. Run the setup wizard — installs Python, pip, and cryptography automatically
-python setup.py
+python ui/setup.py
 
 # 2. Launch NoEyes
-python launch.py
+python ui/launch.py
 ```
 
-`launch.py` walks you through starting a server or connecting to one — no commands to memorize.
+`ui/launch.py` walks you through starting a server or connecting to one — no commands to memorize.
 
 ---
 
@@ -74,11 +77,11 @@ python launch.py
 
 | Platform | Run this first |
 |---|---|
-| Linux / macOS / Termux / iSH | `sh install.sh` |
-| Windows (PowerShell) | `.\install.ps1` |
-| Windows (Command Prompt) | `install.bat` |
+| Linux / macOS / Termux / iSH | `sh install/install.sh` |
+| Windows | `install\install.bat` |
 
-These scripts install Python if missing, then hand off to `setup.py` automatically.
+Both scripts install Python if missing, then hand off to `setup.py` automatically.
+`install.bat` works from both CMD and PowerShell — no need to run `install.ps1` directly.
 
 ---
 
@@ -93,6 +96,12 @@ python noeyes.py --gen-key --key-file ./chat.key
 
 # 3. Start the server (does NOT need the key file)
 python noeyes.py --server --port 5000
+
+# Start without bore tunnel (LAN / static IP / custom tunnel)
+python noeyes.py --server --port 5000 --no-bore
+
+# Start without adding a firewall rule (not needed when using bore tunnel)
+python noeyes.py --server --port 5000 --no-firewall
 
 # 4. Connect clients
 python noeyes.py --connect SERVER_IP --port 5000 --username alice --key-file ./chat.key
@@ -115,7 +124,7 @@ F-Droid link: https://f-droid.org/packages/com.termux/
 ```bash
 pkg install tmux -y
 tmux
-python launch.py
+python ui/launch.py
 # Press Volume Down + D to detach (keeps running in background)
 # tmux attach   to come back
 ```
@@ -133,7 +142,7 @@ termux-setup-storage
 | `/quit` | Disconnect and exit |
 | `/clear` | Clear screen |
 | `/users` | List users in current room |
-| `/nick <name>` | Change your display name |
+| `/nick <n>` | Change your display name |
 | `/join <room>` | Switch to a room (created automatically) |
 | `/leave` | Return to the general room |
 | `/msg <user> <text>` | Send an E2E-encrypted private message |
@@ -142,6 +151,31 @@ termux-setup-storage
 | `/trust <user>` | Trust a user's new key after they reinstall |
 | `/anim on\|off` | Toggle the decrypt animation |
 | `/notify on\|off` | Toggle notification sounds |
+
+---
+
+## TUI Keyboard Shortcuts
+
+| Key | Action |
+|---|---|
+| `\u2191` / `\u2193` | Scroll chat up / down |
+| `PgUp` / `PgDn` | Scroll chat one page |
+| `^P` (Ctrl+P) | Show / hide the sidebar panel |
+| `Esc` | Skip the current decrypt animation |
+| `^C` | Quit |
+
+### Sidebar panel
+
+The chat window has a narrow sidebar on the left that always shows two sections:
+
+- **Top half \u2014 ROOMS** \u2014 all rooms you have joined this session. The active room is highlighted with `\u25b6`.
+- **Bottom half \u2014 USERS** \u2014 everyone currently in your active room.
+
+Each half scrolls independently with the mouse wheel. If there are more items than fit, a `+N more` indicator appears at the bottom of that half.
+
+The panel is **display-only** \u2014 no clickable elements, so you can drag to select and copy text freely on all platforms including Termux (no Shift+drag needed). Use `/join <room>` and `/msg <user>` to interact.
+
+Press **`^P`** to hide the panel and get a full-width chat view. Press again to bring it back. Works identically on Linux, Windows Terminal, Termux, and Terminus \u2014 no function key required.
 
 ---
 
@@ -252,29 +286,38 @@ are useless. After the first run, share the **key file**, not the passphrase.
 
 ```
 NoEyes/
-├── noeyes.py          Entry point and CLI argument parser
-├── server.py          Async blind-forwarder server (zero decryption)
-├── client.py          Terminal chat client (E2E, DH, TOFU, file transfer)
-├── encryption.py      All crypto: Fernet, HKDF, X25519, Ed25519, AES-256-GCM
-├── identity.py        Ed25519 keypair generation and TOFU pubkey store
-├── utils.py           Terminal output, ANSI colours, decrypt animation
-├── config.py          Configuration loading and CLI parsing
+├── noeyes.py              Entry point and CLI argument parser
+├── requirements.txt       pip dependencies (just: cryptography)
 │
-├── launch.py          ★ Guided launcher — arrow-key menu UI
-├── setup.py           ★ Dependency wizard — auto-installs everything needed
-├── update.py          Self-updater — pulls latest from GitHub
+├── core/
+│   ├── encryption.py      All crypto: Fernet, HKDF, X25519, Ed25519, AES-256-GCM
+│   ├── identity.py        Ed25519 keypair generation and TOFU pubkey store
+│   ├── utils.py           Terminal output, ANSI colours, decrypt animation
+│   └── config.py          Configuration loading and CLI parsing
 │
-├── install.sh         Bootstrap: installs Python then runs setup.py
-│                        (Linux / macOS / Termux / iSH)
-├── install.ps1        Bootstrap for Windows PowerShell
-├── install.bat        Bootstrap for Windows CMD
+├── network/
+│   ├── server.py          Async blind-forwarder server (zero decryption)
+│   └── client.py          Terminal chat client (E2E, DH, TOFU, file transfer)
 │
-├── selftest.py        29-test automated test suite
-├── demo2.py           Security features demo (tmux + asciinema)
+├── ui/
+│   ├── launch.py          ★ Guided launcher — arrow-key menu UI
+│   └── setup.py           ★ Dependency wizard — auto-installs everything needed
 │
-├── requirements.txt   pip dependencies (just: cryptography)
-├── CHANGELOG.md
-└── README.md
+├── install/
+│   ├── install.sh         Bootstrap for Linux / macOS / Termux / iSH
+│   ├── install.bat        ★ Bootstrap for Windows (CMD and PowerShell)
+│   ├── install.ps1        Called automatically by install.bat
+│   └── install.py         Cross-platform Python installer
+│
+├── tests/
+│   └── selftest.py        Automated test suite
+│
+├── docs/
+│   ├── README.md
+│   └── CHANGELOG.md
+│
+├── update.py              Self-updater — pulls latest from GitHub
+└── sfx/                   Notification sounds
 ```
 
 ---
@@ -373,6 +416,22 @@ python noeyes.py --server --port 5000 --no-bore
 
 ```bash
 python noeyes.py --server --port 5000 --no-bore
+```
+
+### Firewall rules
+
+When you start a server, NoEyes can automatically add a firewall rule to open the server port so clients can connect directly. The launcher will ask whether you want this and explain when it is needed.
+
+**You do NOT need a firewall rule if you are using bore tunnel** — clients connect via bore.pub and never touch your machine's firewall directly.
+
+You need a firewall rule if clients connect to your IP directly (LAN, static IP, or manual port forwarding).
+
+```bash
+# Skip firewall rule (always safe when using bore tunnel)
+python noeyes.py --server --port 5000 --no-firewall
+
+# Skip both bore and firewall rule (VPS with its own firewall managed separately)
+python noeyes.py --server --port 5000 --no-bore --no-firewall
 ```
 
 ---

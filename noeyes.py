@@ -13,14 +13,18 @@ import os
 import sys
 from getpass import getpass
 
-import config as cfg_mod
-import encryption as enc
-import utils
+from core import config as cfg_mod
+from core import encryption as enc
+from core import utils
+from core import firewall as fw
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+# Keep the noeyes.server logger at INFO for join/leave/listen events,
+# but make sure raw IP addresses never appear at INFO level — see server.py.
+logging.getLogger("noeyes.server").setLevel(logging.INFO)
 
 
 def _resolve_fernet(cfg: dict):
@@ -108,7 +112,20 @@ def _start_bore(port: int) -> None:
     """
     import subprocess, threading, shutil, re
 
-    if not shutil.which("bore"):
+    import sys as _sys, os as _os
+    from pathlib import Path as _Path
+    cargo_bin  = str(_Path.home() / ".cargo" / "bin")
+    bore_exe   = _Path.home() / ".cargo" / "bin" / ("bore.exe" if _sys.platform == "win32" else "bore")
+    bore_cmd   = shutil.which("bore")
+
+    # On Windows the PATH may not be refreshed yet — fall back to direct path
+    if not bore_cmd and bore_exe.exists():
+        bore_cmd = str(bore_exe)
+        # Also add to session PATH so child process inherits it
+        if cargo_bin not in _os.environ.get("PATH", ""):
+            _os.environ["PATH"] = cargo_bin + _os.pathsep + _os.environ.get("PATH", "")
+
+    if not bore_cmd:
         print(utils.cgrey(
             "[bore] not installed — run without tunnel.\n"
             "       Install: https://github.com/ekzhang/bore (see README)"
@@ -116,32 +133,98 @@ def _start_bore(port: int) -> None:
         return
 
     def _run():
+        import time as _time
+        # On Windows: use STARTUPINFO to hide the bore console window
+        # WITHOUT using CREATE_NO_WINDOW or DETACHED_PROCESS which can
+        # cause Windows Terminal to minimize the parent window.
+        kwargs = {}
+        if _sys.platform == "win32":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            kwargs["startupinfo"] = si
+
         try:
             proc = subprocess.Popen(
-                ["bore", "local", str(port), "--to", "bore.pub"],
+                [bore_cmd, "local", str(port), "--to", "bore.pub"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,   # separate stderr so we can log errors
                 text=True,
+                **kwargs,
             )
+
+            # Drain stderr in a separate thread so it never blocks bore
+            def _drain_stderr():
+                for err_line in proc.stderr:
+                    err_line = err_line.strip()
+                    if err_line:
+                        print(utils.cgrey(f"[bore] {err_line}"), flush=True)
+            threading.Thread(target=_drain_stderr, daemon=True).start()
+
+            _root = str(_Path(__file__).parent)
+            _key = "./chat.key"
+            if (_Path(__file__).parent / "ui" / "chat.key").exists() and not (_Path(__file__).parent / "chat.key").exists():
+                _key = "./ui/chat.key"
+
+            announced = False
             for line in proc.stdout:
                 m = re.search(r"bore\.pub:(\d+)", line)
-                if m:
+                if m and not announced:
                     p = m.group(1)
+                    announced = True
                     print(utils.cinfo(
-                        f"\n  ┌─ bore tunnel active ─────────────────────────────\n"
+                        f"\n  ┌─ bore tunnel active ─────────────────────────────────────────\n"
                         f"  │  address : bore.pub:{p}\n"
-                        f"  │  share   : python noeyes.py --connect bore.pub --port {p} --key-file ./chat.key\n"
-                        f"  └──────────────────────────────────────────────────\n"
-                    ))
-                    break
-        except Exception as e:
-            print(utils.cgrey(f"[bore] failed to start: {e}"))
+                        f"  │\n"
+                        f"  │  Share this with anyone who wants to connect:\n"
+                        f"  │\n"
+                        f"  │    1. cd {_root}\n"
+                        f"  │    2. python noeyes.py --connect bore.pub --port {p} --key-file {_key}\n"
+                        f"  │\n"
+                        f"  │  They also need a copy of the key file ({_key})\n"
+                        f"  └──────────────────────────────────────────────────────────────\n"
+                    ), flush=True)
+                # Keep draining stdout — never break, so the pipe never fills
+                # and Windows doesn't kill bore due to a blocked pipe buffer.
 
-    threading.Thread(target=_run, daemon=True).start()
+            # Loop exited — bore process died
+            code = proc.wait()
+            print(utils.cwarn(f"[bore] tunnel closed (exit {code}) — restarting in 5s…"), flush=True)
+            _time.sleep(5)
+
+        except Exception as e:
+            print(utils.cgrey(f"[bore] failed to start: {e}"), flush=True)
+
+    def _run_with_restart():
+        """Keep bore alive — restart it if it crashes."""
+        while True:
+            _run()
+
+    threading.Thread(target=_run_with_restart, daemon=True).start()
 
 
 def run_server(cfg: dict) -> None:
-    from server import NoEyesServer
+    import atexit, signal as _signal
+    from network.server import NoEyesServer
+
+    _port       = cfg["port"]
+    _no_fw      = cfg.get("no_firewall", False)
+
+    # Open firewall rule for the server port (skip if --no-firewall)
+    if not _no_fw:
+        fw.open_port(_port)
+        atexit.register(fw.close_port, _port)
+
+    # Also close on SIGINT / SIGTERM so Ctrl-C and kill both clean up
+    def _sig_handler(signum, frame):
+        if not _no_fw:
+            fw.close_port(_port)
+        sys.exit(0)
+    try:
+        _signal.signal(_signal.SIGINT,  _sig_handler)
+        _signal.signal(_signal.SIGTERM, _sig_handler)
+    except (OSError, ValueError):
+        pass  # signal setup can fail inside threads; atexit still covers it
 
     server = NoEyesServer(
         host="0.0.0.0",
@@ -197,7 +280,7 @@ def _resolve_tls_for_client(host: str, port: int, no_tls: bool) -> tuple:
 
 
 def run_client(cfg: dict) -> None:
-    from client import NoEyesClient
+    from network.client import NoEyesClient
 
     group_fernet, group_key_bytes = _resolve_fernet(cfg)
     username     = _get_username(cfg)
@@ -254,6 +337,7 @@ def main(argv=None) -> None:
         return
 
     if cfg["server"]:
+        fw.check_stale()
         run_server(cfg)
         return
 

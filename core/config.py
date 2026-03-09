@@ -122,6 +122,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        "or when outbound connections to bore.pub are blocked."
                    ))
 
+    p.add_argument("--no-firewall", action="store_true",
+                   help=(
+                       "Skip automatic firewall rule creation. "
+                       "The firewall rule lets clients on your LAN or the internet "
+                       "reach the server port directly. "
+                       "If you are using bore tunnel only, clients never connect "
+                       "to your machine directly so you do not need this rule. "
+                       "Use --no-firewall if you manage firewall rules yourself "
+                       "or if the rule prompt is causing problems."
+                   ))
+
     return p
 
 
@@ -175,9 +186,10 @@ def load_config(argv: list[str] | None = None) -> dict[str, Any]:
         "daemon":   args.daemon,
 
         # Bore tunnel opt-out
-        # True  → skip bore even if installed
-        # False → launch bore automatically (default behaviour)
-        "no_bore":  args.no_bore,
+        "no_bore":       args.no_bore,
+
+        # Firewall rule opt-out
+        "no_firewall":   args.no_firewall,
 
         # Identity paths (not exposed as CLI flags; change via JSON config)
         "identity_path": _get("identity_path", "identity_path", DEFAULT_IDENTITY_PATH),

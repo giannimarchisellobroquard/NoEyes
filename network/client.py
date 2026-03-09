@@ -31,16 +31,17 @@ from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 
-import encryption as enc
-import identity as id_mod
-import utils
-from utils import enter_tui, exit_tui
+from core import encryption as enc
+from core import identity as id_mod
+from core import utils
+from core.utils import enter_tui, exit_tui
 
 # ---------------------------------------------------------------------------
 # File receive directory and type classification
 # ---------------------------------------------------------------------------
 
-RECEIVE_BASE = Path(__file__).parent / "files"
+# Place received files at the project root, not inside the network/ package
+RECEIVE_BASE = Path(__file__).parent.parent / "received_files"
 
 _TYPE_MAP = {
     "images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg",
@@ -350,6 +351,10 @@ class NoEyesClient:
         utils.play_startup_animation()
 
         while True:
+            # Clear accumulated logs so server history replay doesn't stack
+            # on top of messages from the previous (disconnected) session.
+            utils.reset_for_reconnect()
+
             if not self.connect():
                 if not self.reconnect or self._quit:
                     return
@@ -376,6 +381,84 @@ class NoEyesClient:
                 backoff = min(backoff * 2, 60)
                 continue
 
+            # ----------------------------------------------------------------
+            # Join handshake — read the server's response synchronously before
+            # the recv_thread starts.  The server always sends exactly one of:
+            #   auth_ok       — join accepted, history replay follows
+            #   auth_challenge — server wants proof of identity key ownership
+            #   nick_error    — join rejected (name taken / auth failed)
+            # ----------------------------------------------------------------
+            self.sock.settimeout(10.0)
+            try:
+                _hs_result = recv_frame(self.sock)
+            except OSError:
+                _hs_result = None
+            finally:
+                self.sock.settimeout(None)
+
+            if _hs_result is None:
+                if not self.reconnect or self._quit:
+                    return
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+
+            _hs_hdr, _ = _hs_result
+            _hs_event  = _hs_hdr.get("event", "")
+
+            if _hs_event == "auth_challenge":
+                # Server wants us to prove we own the private key for our
+                # claimed vk_hex.  Sign the nonce and send the response.
+                _nonce = str(_hs_hdr.get("nonce", ""))
+                _sig   = enc.sign_message(self.sk_bytes, _nonce.encode()).hex()
+                if not self._send({
+                    "type":  "system",
+                    "event": "auth_response",
+                    "sig":   _sig,
+                }):
+                    if not self.reconnect or self._quit:
+                        return
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                # Read the server's final verdict after verifying our signature
+                self.sock.settimeout(10.0)
+                try:
+                    _hs_result = recv_frame(self.sock)
+                except OSError:
+                    _hs_result = None
+                finally:
+                    self.sock.settimeout(None)
+                if _hs_result is None:
+                    if not self.reconnect or self._quit:
+                        return
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                _hs_hdr, _ = _hs_result
+                _hs_event   = _hs_hdr.get("event", "")
+
+            if _hs_event == "nick_error":
+                utils.print_msg(utils.cerr(
+                    f"[error] {_hs_hdr.get('message', 'Connection rejected by server.')}"
+                ))
+                if not self.reconnect or self._quit:
+                    return
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+
+            if _hs_event != "auth_ok":
+                utils.print_msg(utils.cerr(
+                    "[error] Unexpected server response during join handshake — reconnecting."
+                ))
+                if not self.reconnect or self._quit:
+                    return
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            # auth_ok received — handshake complete, history replay follows
+
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
 
@@ -383,6 +466,25 @@ class NoEyesClient:
 
             # Enter TUI mode after connecting and before starting the input loop
             enter_tui()
+
+            # Register Tab key room-switch callback so utils.py can notify the server
+            import core.encryption as _enc_mod
+            def _tab_cb(room: str) -> None:
+                self._room_fernet = _enc_mod.derive_room_fernet(self._master_key_bytes, room)
+                self.room = room
+                self._send({"type": "command", "event": "join_room", "room": room})
+            utils._tab_switch_cb = _tab_cb
+
+            # Register panel click callback
+            def _panel_cb(action: str, name: str) -> None:
+                if action == "join":
+                    self._process_input(f"/join {name}")
+                elif action == "msg":
+                    utils._panel_prefill(f"/msg {name} ")
+            utils.set_panel_action_cb(_panel_cb)
+
+            # Fetch initial user list so the sidebar is populated on connect
+            self._send({"type": "command", "event": "users_req", "room": self.room})
 
             try:
                 self._running = True
@@ -702,7 +804,7 @@ class NoEyesClient:
             "mid":  os.urandom(16).hex(),
         }
         self._send(header, payload)
-        utils.log_and_print(self.room, utils.format_own_message(self.username, text, ts))
+        utils.log_and_print(self.room, utils.format_message(self.username, text, ts, is_own=True))
         utils.mark_seen(self.room, self.username, ts, text)
 
     def _send_privmsg_encrypted(self, peer: str, text: str, tag: str = "") -> None:
@@ -1036,21 +1138,22 @@ class NoEyesClient:
         if event == "join":
             uname = header.get("username", "?")
             utils.log_and_print(self.room, utils.format_system(f"{uname} has joined the chat.", ts))
+            # Refresh users list so the panel updates immediately
+            self._send({"type": "command", "event": "users_req", "room": self.room})
         elif event == "leave":
             uname  = header.get("username", "?")
             reason = header.get("reason", "disconnect")
             if reason == "room_change":
                 utils.log_and_print(self.room, utils.format_system(f"{uname} switched rooms.", ts))
-                # Pairwise key is preserved — they're still online, just in another room.
-                # /msg and /send will still work across rooms.
             else:
                 utils.log_and_print(self.room, utils.format_system(f"{uname} has left the chat.", ts))
-                # Real disconnect — clear pairwise state so stale keys don't accumulate.
                 self._pairwise.pop(uname, None)
                 self._pairwise_raw.pop(uname, None)
                 self._dh_pending.pop(uname, None)
                 self._file_queue.pop(uname, None)
                 self._msg_queue.pop(uname, None)
+            # Refresh users list so the panel updates immediately
+            self._send({"type": "command", "event": "users_req", "room": self.room})
         elif event == "nick":
             old = header.get("old_nick", "?").lower()
             new = header.get("new_nick", "?").lower()
@@ -1081,8 +1184,11 @@ class NoEyesClient:
         event = header.get("event", "")
         if event == "users_resp":
             users = header.get("users", [])
-            utils.print_msg(utils.cinfo(f"[users] Online in '{header.get('room', self.room)}': "
-                              + ", ".join(users) or "(none)"))
+            room  = header.get("room", self.room)
+            utils.set_room_users(room, users)
+            utils.print_msg(utils.cinfo(
+                f"[users] Online in '{room}': " + (", ".join(users) if users else "(none)")
+            ))
 
     # ------------------------------------------------------------------
     # Input loop
@@ -1155,6 +1261,8 @@ class NoEyesClient:
             self.room = new_room
             utils.switch_room_display(new_room)
             self._send({"type": "command", "event": "join_room", "room": new_room})
+            # Request fresh user list for the new room
+            self._send({"type": "command", "event": "users_req", "room": new_room})
             return
 
         if cmd == "/anim" and len(parts) >= 2:
@@ -1333,34 +1441,31 @@ class NoEyesClient:
             utils.print_msg(utils.cerr(f"[send] Error reading file: {e}"))
 
     def _print_help(self) -> None:
-        help_text = """
-[commands]
-  /help                 Show this message
-  /quit                 Disconnect and exit
-  /clear                Clear screen
-  /users                List online users in current room
-  /nick <n>             Change your display name
-  /join <room>          Switch to a different room (created automatically)
-  /leave                Return to 'general' room
-  /msg <user> <text>    Send an E2E-encrypted private message
-  /send <user> <path>   Send an encrypted file to a user
-  /trust <user>         Trust a user's new key after a TOFU mismatch warning
-  /anim on|off          Toggle the decrypt animation
-  /notify on|off        Toggle all notification sounds
-  /whoami               Show your username and identity fingerprint
-
-[message tags]  prefix your message to color it and trigger a sound
-  !ok      <msg>        Green  — success / confirmation       (sound: ok)
-  !warn    <msg>        Yellow — warning / heads up           (sound: warn)
-  !danger  <msg>        Red    — critical / urgent            (sound: danger)
-  !info    <msg>        Blue   — info / status update         (sound: info)
-  !req     <msg>        Purple — request / needs action       (sound: req)
-  !?       <msg>        Cyan   — question / asking            (sound: ask)
-
-  Tags travel inside the encrypted payload — the server never sees them.
-  Examples:
-    !danger server is going down in 5 minutes
-    !req    can someone review my PR?
-    !ok     deployment successful
-"""
-        utils.print_msg(utils.cinfo(help_text))
+        entries = [
+            ("", "[commands]",       ""),
+            ("/help",                "Show this message",                 ""),
+            ("/quit",                "Disconnect and exit",               ""),
+            ("/clear",               "Clear screen",                      ""),
+            ("/users",               "List online users in room",         ""),
+            ("/nick <n>",            "Change display name",               ""),
+            ("/join <room>",         "Switch room",                       ""),
+            ("/leave",               "Return to general",                 ""),
+            ("/msg <user> <text>",   "E2E private message",               ""),
+            ("/send <user> <path>",  "Send encrypted file",               ""),
+            ("/trust <user>",        "Trust key after TOFU mismatch",     ""),
+            ("/anim on|off",         "Toggle decrypt animation",          ""),
+            ("/notify on|off",       "Toggle notification sounds",        ""),
+            ("/whoami",              "Show identity fingerprint",         ""),
+            ("", "[message tags]",   ""),
+            ("!ok <msg>",            "Green — success",                   ""),
+            ("!warn <msg>",          "Yellow — warning",                  ""),
+            ("!danger <msg>",        "Red — critical",                    ""),
+            ("!info <msg>",          "Blue — info",                       ""),
+            ("!req <msg>",           "Purple — request",                  ""),
+            ("!? <msg>",             "Cyan — question",                   ""),
+        ]
+        for cmd, desc, _ in entries:
+            if not cmd:
+                utils.print_msg(utils.cinfo(desc))
+            else:
+                utils.print_msg(utils.cgrey(f"  {cmd:<22}{desc}"))

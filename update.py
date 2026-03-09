@@ -16,10 +16,10 @@ Integrity verification:
     · A network attacker tampering with files in transit (even over HTTPS)
     · Accidental corruption on GitHub's CDN
 
-  Note: the manifest lives in the same repo so a compromised GitHub account
-  could push both malicious files and a matching manifest.  For protection
-  against that, keep an eye on commit history and verify the commit SHA
-  against a trusted source before updating.
+  The manifest is Ed25519-signed with an offline key that never touches the
+  repo.  update.py verifies the signature against a hardcoded public key before
+  trusting any hash in the manifest.  A compromised GitHub account cannot push
+  a valid signed manifest without the repo owner's private key.
 
 Usage:
     python update.py           — update to latest
@@ -28,6 +28,18 @@ Usage:
 """
 
 import argparse, hashlib, json, os, shutil, sys, tempfile, urllib.request
+
+# ---------------------------------------------------------------------------
+# Release signing public key
+# ---------------------------------------------------------------------------
+# This is the Ed25519 public key for verifying manifest.json signatures.
+# It is hardcoded here so that even if an attacker gains push access to the
+# GitHub repo, they cannot forge a valid manifest without the private key,
+# which the repo owner keeps offline.
+# To rotate the key: update this constant and re-sign all manifests with the
+# new private key using gen_manifest.py.
+RELEASE_PUBKEY_HEX = "22942493dda8680355434ad623b707db2fd40a4656d40b1d13288bef433f8654"
+
 from pathlib import Path
 
 REPO_OWNER = "Ymsniper"
@@ -40,27 +52,33 @@ RAW_BASE   = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}"
 MANIFEST_FILE = "manifest.json"
 
 TOOL_FILES = [
-    # core
-    "noeyes.py", "server.py", "client.py", "encryption.py",
-    "identity.py", "utils.py", "config.py",
+    # entry points
+    "noeyes.py", "update.py", "gen_manifest.py",
+    # core package
+    "core/__init__.py",
+    "core/encryption.py", "core/identity.py", "core/utils.py",
+    "core/config.py", "core/firewall.py",
+    # network package
+    "network/__init__.py",
+    "network/server.py", "network/client.py",
     # UI / helpers
-    "launch.py",
-    "setup.py",
-    "update.py",
-    # bootstrap
-    "install.sh",
-    "install.ps1",
-    "install.bat",
-    # tests / demos
-    "selftest.py",
-    "demo2.py",
-    "selftest_demo2.py",
+    "ui/__init__.py",
+    "ui/launch.py", "ui/setup.py",
+    # install / bootstrap
+    "install/__init__.py",
+    "install/install.sh", "install/install.ps1",
+    "install/install.bat", "install/install.py",
+    # tests
+    "tests/__init__.py",
+    "tests/selftest.py",
+    "tests/test_launch_windows.py", "tests/test_utils_windows.py",
     # docs
-    "README.md", "CHANGELOG.md", "requirements.txt", ".gitignore",
+    "docs/README.md", "docs/CHANGELOG.md", "docs/CONNECTION_GUIDE.md",
+    # misc
+    "requirements.txt", "manifest.json", "noeyes_config.json.example",
+    "setup_firewall.sh", "demo.svg",
     # sfx
-    "sfx/diskette.mp3",
-    "sfx/crt.mp3",
-    "sfx/logo.mp3",
+    "sfx/diskette.mp3", "sfx/crt.mp3", "sfx/logo.mp3",
 ]
 
 PROTECTED = {
@@ -153,18 +171,45 @@ def cmd_update(force=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
-        # ── Step 1: Download manifest ─────────────────────────────────────────
+        # ── Step 1: Download and verify manifest signature ───────────────────
         info("Downloading integrity manifest…")
         try:
             manifest_data = _get(f"{RAW_BASE}/{re['branch']}/{MANIFEST_FILE}")
-            manifest = json.loads(manifest_data)
+            manifest_obj  = json.loads(manifest_data)
         except Exception as e:
-            # No manifest in repo yet — warn but allow update so existing
-            # installs without a manifest can still update to add one.
-            warn(f"No manifest found ({e}) — skipping integrity check.")
-            warn("Update will proceed but files are NOT hash-verified.")
-            warn("Add manifest.json to the repo to enable integrity checks.")
-            manifest = {}
+            err(f"Could not download manifest.json: {e}")
+            err("Aborting — your installation is unchanged.")
+            sys.exit(1)
+
+        # Verify Ed25519 signature before trusting any hash in the manifest.
+        # The canonical bytes are the sorted-keys compact JSON of the "files"
+        # dict — exactly what gen_manifest.py signs.
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+            from cryptography.exceptions import InvalidSignature
+
+            vk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(RELEASE_PUBKEY_HEX))
+            files_dict = manifest_obj.get("files", {})
+            canonical  = json.dumps(files_dict, sort_keys=True, separators=(",", ":")).encode()
+            sig_hex    = manifest_obj.get("sig", "")
+            if not sig_hex:
+                err("manifest.json has no signature field.")
+                err("Aborting — your installation is unchanged.")
+                sys.exit(1)
+            vk.verify(bytes.fromhex(sig_hex), canonical)
+            ok("Manifest signature verified.")
+            manifest = files_dict
+        except InvalidSignature:
+            err("MANIFEST SIGNATURE INVALID!")
+            err("The manifest may have been tampered with.")
+            err("Do NOT update until you can verify the repo is clean.")
+            err("Aborting — your installation is unchanged.")
+            sys.exit(1)
+        except Exception as e:
+            err(f"Signature verification failed: {e}")
+            err("Aborting — your installation is unchanged.")
+            sys.exit(1)
 
         # ── Step 2: Download all files ────────────────────────────────────────
         info("Downloading files…")

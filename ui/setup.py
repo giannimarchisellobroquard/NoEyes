@@ -362,8 +362,18 @@ def check_rust():
         return False
 
 def check_bore():
-    """Return True if bore binary is on PATH or in ~/.cargo/bin."""
+    """Return True if bore binary is on PATH or in ~/.cargo/bin.
+    On Windows, also fixes the permanent PATH if bore exists but isn't registered."""
     cargo_bin = str(Path.home() / ".cargo" / "bin")
+    bore_exe  = Path.home() / ".cargo" / "bin" / ("bore.exe" if sys.platform == "win32" else "bore")
+
+    # If bore.exe exists on disk but isn't in the permanent Windows PATH, fix it silently
+    if sys.platform == "win32" and bore_exe.exists():
+        added = _add_to_windows_path_permanently(cargo_bin)
+        if added:
+            print(f"  {cy('PATH')} updated — added {gy(cargo_bin)} to your Windows user PATH")
+            print(f"  {gy('Open a new terminal for this to take effect in new windows.')}")
+
     env = os.environ.copy()
     if cargo_bin not in env.get("PATH", ""):
         env["PATH"] = cargo_bin + os.pathsep + env.get("PATH", "")
@@ -371,7 +381,7 @@ def check_bore():
         r = subprocess.run(["bore", "--version"], capture_output=True, env=env)
         return r.returncode == 0
     except FileNotFoundError:
-        return False
+        return bore_exe.exists()  # exe is there but PATH not refreshed yet — still counts
 
 def check_cryptography():
     r = subprocess.run(
@@ -506,6 +516,91 @@ def install_rust():
 
 # ── bore ─────────────────────────────────────────────────────────────────────
 
+
+
+def _add_to_windows_path_permanently(directory):
+    """Add a directory to the Windows user PATH permanently via the registry."""
+    if sys.platform != "win32":
+        return
+    directory = str(directory)
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Environment",
+            0, winreg.KEY_READ | winreg.KEY_WRITE
+        )
+        try:
+            current, _ = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            current = ""
+        if directory.lower() not in current.lower():
+            new_path = current + ";" + directory if current else directory
+            winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, new_path)
+            winreg.CloseKey(key)
+            # Notify running programs of the PATH change
+            try:
+                import ctypes
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                ctypes.windll.user32.SendMessageTimeoutW(
+                    HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", 2, 5000, None
+                )
+            except Exception:
+                pass
+            return True  # was added
+        winreg.CloseKey(key)
+        return False  # already there
+    except Exception:
+        return False
+
+def _install_bore_windows(cargo_bin):
+    """Download pre-built bore.exe from GitHub releases — no Rust compiler needed."""
+    import urllib.request, zipfile, tempfile, shutil
+    
+    # Get latest release tag from GitHub API
+    api_url = "https://api.github.com/repos/ekzhang/bore/releases/latest"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "NoEyes-installer"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            import json
+            data = json.loads(resp.read())
+            tag = data["tag_name"]  # e.g. "v0.5.0"
+    except Exception as e:
+        return False, f"Could not fetch bore release info: {e}"
+
+    zip_url = f"https://github.com/ekzhang/bore/releases/download/{tag}/bore-{tag}-x86_64-pc-windows-msvc.zip"
+    try:
+        tmp_zip = str(Path(tempfile.gettempdir()) / "bore-windows.zip")
+        with urllib.request.urlopen(zip_url, timeout=60) as resp:
+            open(tmp_zip, "wb").write(resp.read())
+        
+        # Extract bore.exe to ~/.cargo/bin (already on PATH from cargo installs)
+        dest_dir = Path.home() / ".cargo" / "bin"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        
+        with zipfile.ZipFile(tmp_zip) as zf:
+            for name in zf.namelist():
+                if name.endswith("bore.exe") or name == "bore.exe":
+                    with zf.open(name) as src, open(dest_dir / "bore.exe", "wb") as dst:
+                        dst.write(src.read())
+                    break
+        
+        os.unlink(tmp_zip)
+        
+        # Add to PATH for this session and permanently in Windows registry
+        cargo_bin_str = str(dest_dir)
+        if cargo_bin_str not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = cargo_bin_str + os.pathsep + os.environ.get("PATH", "")
+        _add_to_windows_path_permanently(cargo_bin_str)
+        
+        bore_exe = dest_dir / "bore.exe"
+        if bore_exe.exists():
+            return True, str(bore_exe)
+        return False, "bore.exe not found after extraction"
+    except Exception as e:
+        return False, str(e)
+
 def install_bore():
     """
     Install bore-cli via cargo — no sudo required anywhere.
@@ -518,6 +613,16 @@ def install_bore():
       4. On any platform, rustup --no-modify-path is always used so we
          never touch system files.
     """
+    # Windows: download pre-built exe (no compiler needed)
+    if sys.platform == "win32":
+        print(f"  {cy('Windows')}: downloading pre-built bore.exe from GitHub...")
+        success, result = _install_bore_windows(str(Path.home() / ".cargo" / "bin"))
+        if success:
+            print(f"  bore installed: {result}")
+            print("  NOTE: open a NEW terminal for bore to be recognised in PATH")
+            return True
+        print(f"  Pre-built download failed ({result}) — trying cargo compile...")
+
     # Termux: try native package (no compilation needed)
     if P.is_termux:
         if _ok_run(["pkg", "install", "-y", "bore"]):
@@ -540,13 +645,24 @@ def install_bore():
         # Install Rust via rustup — completely user-local, no sudo
         import urllib.request, tempfile
         try:
-            with urllib.request.urlopen("https://sh.rustup.rs") as resp:
-                script = resp.read()
-            with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
-                f.write(script); tmp = f.name
-            os.chmod(tmp, 0o755)
-            r = _run(["sh", tmp, "-y", "--no-modify-path"])
-            os.unlink(tmp)
+            if sys.platform == "win32":
+                # Windows needs rustup-init.exe, not the shell script
+                url = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
+                tmp = str(Path(tempfile.gettempdir()) / "rustup-init.exe")
+                with urllib.request.urlopen(url) as resp:
+                    open(tmp, "wb").write(resp.read())
+                r = _run([tmp, "-y", "--no-modify-path"])
+            else:
+                with urllib.request.urlopen("https://sh.rustup.rs") as resp:
+                    script = resp.read()
+                with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
+                    f.write(script); tmp = f.name
+                os.chmod(tmp, 0o755)
+                r = _run(["sh", tmp, "-y", "--no-modify-path"])
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
             if r.returncode != 0:
                 return False
             os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
@@ -557,13 +673,21 @@ def install_bore():
     # Install bore-cli via cargo (installs to ~/.cargo/bin — no sudo)
     r = subprocess.run(
         ["cargo", "install", "bore-cli"],
-        capture_output=True, env=cargo_env
+        capture_output=False, env=cargo_env
     )
     if r.returncode == 0:
         # Make sure bore is in this process's PATH too
         if cargo_bin not in os.environ.get("PATH", ""):
             os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
-        return check_bore()
+        # Permanently add to Windows user PATH so new terminals see it
+        if sys.platform == "win32":
+            _add_to_windows_path_permanently(cargo_bin)
+        # Also check directly — PATH may not refresh in same terminal session
+        bore_bin = Path.home() / ".cargo" / "bin" / ("bore.exe" if sys.platform == "win32" else "bore")
+        if check_bore() or bore_bin.exists():
+            if sys.platform == "win32":
+                print(f"  NOTE: open a NEW terminal for bore to be recognised in PATH")
+            return True
     return False
 
 # ── cryptography ──────────────────────────────────────────────────────────────
@@ -643,11 +767,18 @@ def screen_status():
         checks.append(("bore  (online tunnel)", None,
                        "optional — install if you want to host a server online"))
 
-    # NoEyes core files
-    here = Path(__file__).parent
-    core = ["noeyes.py","server.py","client.py","encryption.py",
-            "identity.py","utils.py","config.py"]
-    missing = [f for f in core if not (here / f).exists()]
+    # NoEyes core files — check against new folder structure
+    root = Path(__file__).parent.parent
+    core = [
+        "noeyes.py",
+        "network/server.py",
+        "network/client.py",
+        "core/encryption.py",
+        "core/identity.py",
+        "core/utils.py",
+        "core/config.py",
+    ]
+    missing = [f for f in core if not (root / f).exists()]
     checks.append(("NoEyes core files", not missing,
                    "" if not missing else f"missing: {', '.join(missing)}"))
 
@@ -798,14 +929,31 @@ def screen_check_only():
 def screen_already_done():
     clear()
     print(LOGO)
+    bore_ok = check_bore()
+    bore_line = (gr("✔  bore installed — bore.pub tunnel ready")
+                 if bore_ok else
+                 gy("·  bore not installed  (optional — needed to host a server online)"))
     print(box("Already Installed", [
         gr("✔  All dependencies are already installed."),
+        bore_line,
         "",
         f"Run  {cy(bo('python launch.py'))}  to start NoEyes.",
         "",
         gy("To force a reinstall:  python setup.py --force"),
     ], colour=gr))
     print()
+    # Even if everything else is installed, ask about bore if missing
+    if not bore_ok:
+        want = confirm("Install bore now? (lets you host a server online via bore.pub)", default=False)
+        if want:
+            print()
+            ok_flag = spinner_line("Installing bore", install_bore)
+            print()
+            if ok_flag:
+                print(f"  {gr('✔')}  bore installed — open a new terminal for it to be recognised in PATH")
+            else:
+                print(f"  {rd('✘')}  bore install failed — try again later")
+            print()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Force-reinstall screen
@@ -814,20 +962,27 @@ def screen_already_done():
 def screen_force():
     clear()
     print(LOGO)
+    bore_ok = check_bore()
+    bore_status = gr("already installed") if bore_ok else gy("not installed")
     print(box("Force Reinstall",
-        ["This will reinstall cryptography even if it's already present.",
-         "", gy("pip, build tools, and Rust are skipped if already installed.")],
+        ["This will reinstall selected components even if already present.",
+         "", gy("pip, build tools, and Rust are skipped if already installed."),
+         "", f"bore status: {bore_status}"],
         colour=yl))
     print()
-    if not confirm("Reinstall cryptography?", default=True):
-        return
+    do_crypto = confirm("Reinstall cryptography?", default=True)
+    do_bore   = confirm(f"{'Reinstall' if bore_ok else 'Install'} bore? (online tunnel)", default=not bore_ok)
     print()
-    ok_flag = spinner_line("Reinstalling cryptography", install_cryptography)
-    if ok_flag:
-        print(f"  {gr('✔')}  cryptography reinstalled")
-    else:
-        print(f"  {rd('✘')}  reinstall failed")
-    print()
+    if do_crypto:
+        ok_flag = spinner_line("Reinstalling cryptography", install_cryptography)
+        print(f"  {gr('✔') if ok_flag else rd('✘')}  cryptography {'reinstalled' if ok_flag else 'failed'}")
+        print()
+    if do_bore:
+        ok_flag = spinner_line(f"{'Reinstalling' if bore_ok else 'Installing'} bore", install_bore)
+        print(f"  {gr('✔') if ok_flag else rd('✘')}  bore {'installed' if ok_flag else 'failed'}")
+        if ok_flag:
+            print(f"  {gy('NOTE: open a new terminal for bore to be recognised in PATH')}")
+        print()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main wizard
@@ -856,7 +1011,14 @@ def main_wizard():
         # ── scan status ───────────────────────────────────────────────────────
         st, all_good = screen_status()
 
-        if all_good:
+        if all_good and check_bore():
+            # Everything including bore is installed — fully done
+            screen_already_done()
+            pause()
+            return
+
+        if all_good and not check_bore():
+            # Deps done but bore missing — screen_already_done will ask
             screen_already_done()
             pause()
             return

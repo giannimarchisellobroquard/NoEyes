@@ -1,14 +1,22 @@
 @echo off
-:: install.bat — NoEyes Windows installer (cmd.exe fallback)
-:: Prefer install.ps1 if you have PowerShell.
-:: Usage:  install.bat
+setlocal enabledelayedexpansion
+:: install.bat — NoEyes Windows installer
+:: Automatically launches install.ps1 with ExecutionPolicy Bypass.
+:: If PowerShell is unavailable, falls back to pure-batch Python detection.
 
 echo.
 echo   NoEyes -- Windows Installer
 echo.
 
-:: ── find Python ──────────────────────────────────────────────────────────────
+:: ── Try PowerShell with bypass first (cleanest path) ─────────────────────────
+where powershell >nul 2>&1
+if %errorlevel% == 0 (
+    echo   Launching via PowerShell...
+    powershell -ExecutionPolicy Bypass -File "%~dp0install.ps1" %*
+    goto :end
+)
 
+:: ── PowerShell not available — pure batch fallback ───────────────────────────
 set PYTHON=
 
 for %%C in (python python3 py) do (
@@ -35,12 +43,12 @@ echo   Check "Add Python to PATH" during installation.
 echo   Then re-run this script.
 echo.
 
-:: Try winget as a courtesy
 where winget >nul 2>&1
 if %errorlevel% == 0 (
     echo   Attempting: winget install Python.Python.3.12
     winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements
-    echo   If install succeeded, close this window and re-run install.bat
+    echo.
+    echo   Python installed. Please close this window and re-run install.bat
 )
 goto :end
 
@@ -48,13 +56,9 @@ goto :end
 for /f "tokens=*" %%v in ('"%PYTHON%" -c "import sys; print(\"%%d.%%d.%%d\" %% sys.version_info[:3])"') do set PYVER=%%v
 echo     Python %PYVER% found
 
-:: ── hand off to install.py ────────────────────────────────────────────────────
-
-set SCRIPT_DIR=%~dp0
-set INSTALLER=%SCRIPT_DIR%install.py
-
+set INSTALLER=%~dp0install.py
 if not exist "%INSTALLER%" (
-    echo   [!] install.py not found in %SCRIPT_DIR%
+    echo   [!] install.py not found in %~dp0
     goto :end
 )
 

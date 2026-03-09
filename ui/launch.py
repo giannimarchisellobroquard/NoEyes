@@ -12,11 +12,19 @@ Usage:
 import os
 import sys
 import subprocess
-import termios
-import tty
 import shutil
 import json
 from pathlib import Path
+
+# Compatibility: termios / tty only exist on Unix.
+# On Windows we fall back to msvcrt for raw keypress reading.
+try:
+    import termios
+    import tty
+    _UNIX = True
+except ImportError:
+    import msvcrt
+    _UNIX = False
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
 
@@ -46,7 +54,7 @@ def dim(s): return f"{DIM}{s}{R}" if _tty() else s
 # ── Terminal helpers ──────────────────────────────────────────────────────────
 
 def clear():
-    os.system("clear")
+    os.system("cls" if os.name == "nt" else "clear")
 
 def hide_cursor():
     if _tty(): sys.stdout.write("\033[?25l"); sys.stdout.flush()
@@ -58,8 +66,9 @@ def getch() -> str:
     """
     Read a single keypress from the raw file descriptor.
 
-    Uses os.read(fd, 1) throughout — never sys.stdin.read() — so Python's
-    internal stdio buffer stays empty and select() remains accurate.
+    On Unix: uses os.read(fd, 1) via termios/tty so Python's internal stdio
+    buffer stays empty and select() remains accurate.
+    On Windows: uses msvcrt.getwch() with special-key handling.
 
     Handles both escape sequence formats terminals send for arrows/scroll:
       CSI  ESC [ A/B/C/D        — standard xterm / most terminals
@@ -67,6 +76,17 @@ def getch() -> str:
     Extended CSI sequences (shifted arrows, F-keys, mouse) are consumed
     silently so nothing leaks into the menu as printable characters.
     """
+    if not _UNIX:
+        # Windows path — msvcrt.getwch() returns a single character.
+        # Arrow / special keys send two calls: first '\x00' or '\xe0', then the key code.
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            return {"H": "UP", "P": "DOWN", "M": "RIGHT", "K": "LEFT"}.get(code, "ESC")
+        if ch == "\r":
+            return "\n"
+        return ch
+
     import select as _sel
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -85,7 +105,6 @@ def getch() -> str:
 
         if nxt == "[":
             # CSI sequence — read until alphabetic terminator or ~
-            # Accumulate parameter bytes so we can identify the key
             param = ""
             while True:
                 r2, _, _ = _sel.select([fd], [], [], 0.05)
@@ -96,13 +115,12 @@ def getch() -> str:
                     param += b
                     break
                 param += b
-            # Map common final bytes to friendly names
             final = param[-1] if param else ""
             if final == "A": return "UP"
             if final == "B": return "DOWN"
             if final == "C": return "RIGHT"
             if final == "D": return "LEFT"
-            return "ESC"   # unknown CSI — consumed, ignore
+            return "ESC"
 
         elif nxt == "O":
             # SS3 sequence — exactly one more byte
@@ -115,7 +133,6 @@ def getch() -> str:
                 if fin == "D": return "LEFT"
             return "ESC"
 
-        # Unknown ESC sequence — nxt already consumed
         return "ESC"
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -124,19 +141,13 @@ def input_line(prompt: str, default: str = "") -> str:
     """
     Prompt for a line of text with full arrow key support.
 
-    Uses os.read(fd,1) so escape sequences (both CSI ESC[A and SS3 ESC OA
-    from Konsole) are consumed silently instead of printing ^[[D on screen.
+    On Unix: uses os.read(fd,1) so escape sequences are consumed silently.
+    On Windows: uses msvcrt.getwch() for raw character reading.
     Left/right arrows move the cursor. Up arrow fills the default.
     """
-    import select as _sel
-
     hint = f" {gy(f'[{default}]')}" if default else " "
     sys.stdout.write(f"\n{prompt}{hint}")
     sys.stdout.flush()
-
-    fd  = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    show_cursor()
 
     buf = []   # list of chars
     cur = 0    # cursor position
@@ -148,6 +159,41 @@ def input_line(prompt: str, default: str = "") -> str:
         if offset < 0:
             sys.stdout.write(f"\033[{-offset}D")
         sys.stdout.flush()
+
+    show_cursor()
+
+    if not _UNIX:
+        # Windows path using msvcrt
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                sys.stdout.write("\n"); sys.stdout.flush(); break
+            elif ch == "\x03":
+                sys.stdout.write("\n"); sys.stdout.flush()
+                raise KeyboardInterrupt
+            elif ch == "\x04":
+                sys.stdout.write("\n"); sys.stdout.flush()
+                raise EOFError
+            elif ch in ("\x7f", "\x08"):
+                if cur > 0:
+                    buf.pop(cur - 1); cur -= 1; _redraw()
+            elif ch in ("\x00", "\xe0"):
+                code = msvcrt.getwch()
+                if code == "K" and cur > 0:       # left
+                    cur -= 1; _redraw()
+                elif code == "M" and cur < len(buf):  # right
+                    cur += 1; _redraw()
+                elif code == "H" and not buf and default:  # up → default
+                    buf[:] = list(default); cur = len(buf); _redraw()
+            elif ch >= " ":
+                buf.insert(cur, ch); cur += 1; _redraw()
+        hide_cursor()
+        result = "".join(buf).strip()
+        return result if result else default
+
+    import select as _sel
+    fd  = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
 
     def _rb() -> str:
         return os.read(fd, 1).decode("utf-8", errors="replace")
@@ -187,7 +233,6 @@ def input_line(prompt: str, default: str = "") -> str:
                     elif fin == "A" and not buf and default: # up → default
                         buf[:] = list(default); cur = len(buf); _redraw()
                     elif not (fin.isalpha() or fin == "~"):
-                        # extended sequence — drain until terminator
                         while True:
                             r3, _, _ = _sel.select([fd], [], [], 0.05)
                             if not r3: break
@@ -309,10 +354,10 @@ def check_deps() -> dict:
     checks["bore"] = bool(shutil.which("bore"))
 
     # noeyes files
-    here = Path(__file__).parent
+    root = Path(__file__).parent.parent
     checks["noeyes"] = all(
-        (here / f).exists()
-        for f in ("noeyes.py", "server.py", "client.py", "encryption.py")
+        (root / f).exists()
+        for f in ("noeyes.py", "network/server.py", "network/client.py", "core/encryption.py")
     )
 
     return checks
@@ -358,8 +403,8 @@ def generate_key_flow() -> str:
     if not path.endswith(".key"):
         path += ".key"
 
-    here = Path(__file__).parent
-    noeyes = here / "noeyes.py"
+    root = Path(__file__).parent.parent
+    noeyes = root / "noeyes.py"
     r = subprocess.run(
         [sys.executable, str(noeyes), "--gen-key", "--key-file", path],
         capture_output=True, text=True)
@@ -418,13 +463,36 @@ def server_flow(deps: dict):
         print(f"  {gy('Install bore for internet access: https://github.com/ekzhang/bore')}")
         use_bore = False
 
+    # Firewall rule — optional, with explanation
+    clear()
+    print(LOGO)
+    fw_explain = [
+        f"NoEyes can add a firewall rule to open port {bo(str(port))} on this machine.",
+        "",
+        f"  {gr('You need this if')} clients connect to your IP directly",
+        f"  (LAN connections, static IP, or manual port forwarding).",
+        "",
+        f"  {yl('You do NOT need this if')} you are using bore tunnel —",
+        "  clients connect via bore.pub and never touch your firewall.",
+        "",
+        "  You can also skip this and manage your firewall yourself.",
+    ]
+    print(box("Firewall Rule", fw_explain, colour=cy))
+    print()
+    if use_bore:
+        print(f"  {gy('Bore tunnel is enabled — firewall rule is not required.')}")
+        print()
+    open_firewall = confirm(f"  {bo('Add firewall rule for port')} {bo(str(port))}{'?' if not use_bore else ' (optional since bore is on)?'}", default=not use_bore)
+
     # Summary box
     clear()
     print(LOGO)
-    bore_line = gr("✔  bore tunnel enabled (internet accessible)") if use_bore else gy("—  LAN / local only (--no-bore)")
+    bore_line = gr("\u2714  bore tunnel enabled (internet accessible)") if use_bore else gy("\u2014  LAN / local only (--no-bore)")
+    fw_line   = gr(f"\u2714  rule will be added for port {port}") if open_firewall else gy(f"\u2014  skipped (--no-firewall)")
     print(box("Server Ready to Start", [
         f"Port       :  {bo(str(port))}",
         f"Tunnel     :  {bore_line}",
+        f"Firewall   :  {fw_line}",
         "",
         "The server is a blind forwarder — it cannot read any messages.",
         "Clients connect with their key file and can start chatting.",
@@ -434,18 +502,23 @@ def server_flow(deps: dict):
     if not confirm(f"  {bo('Start server now?')}"):
         return
 
-    here = Path(__file__).parent
-    noeyes = here / "noeyes.py"
+    root = Path(__file__).parent.parent
+    noeyes = root / "noeyes.py"
     cmd = [sys.executable, str(noeyes), "--server", "--port", str(port)]
     if not use_bore:
         cmd.append("--no-bore")
+    if not open_firewall:
+        cmd.append("--no-firewall")
     if os.environ.get("NOEYES_NO_TLS"):
         cmd.append("--no-tls")
 
     print(f"\n  {cy('Starting server...')}\n")
     show_cursor()
     try:
-        subprocess.run(cmd)
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"\n  {rd('Server exited with error code')} {result.returncode}")
+            input("\n  Press Enter to return to menu...")
     except KeyboardInterrupt:
         pass
 
@@ -491,15 +564,31 @@ def client_flow():
         ], colour=bl))
         print()
 
-    host = env_host or input_line(f"  {bo('Server address')}", "")
-    if not host:
-        print(f"\n  {rd('✘')} No address entered. Cancelled.")
+    host_raw = env_host or input_line(f"  {bo('Server address')}", "")
+    if not host_raw:
+        print(f"\n  {rd(chr(0x2718))} No address entered. Cancelled.")
         input(f"\n  {gy('Press Enter to go back...')}")
         return
 
+    # Allow host:port shorthand (e.g. bore.pub:48255)
+    _port_from_host = None
+    if ":" in host_raw and not host_raw.startswith("["):
+        _parts = host_raw.rsplit(":", 1)
+        if _parts[1].isdigit():
+            host = _parts[0]
+            _port_from_host = int(_parts[1])
+        else:
+            host = host_raw
+    else:
+        host = host_raw
+
     try:
-        port = int(env_port or input_line(f"  {bo('Port')}", "5000"))
-    except ValueError:
+        _port_input = env_port or (_port_from_host is not None and str(_port_from_host)) or input_line(f"  {bo('Port')}", "5000")
+        port = int(_port_input)
+        if not (0 < port <= 65535):
+            raise ValueError
+    except (ValueError, TypeError):
+        print(f"\n  {yl('Invalid port — defaulting to 5000.')}")
         port = 5000
 
     username = env_username or input_line(f"  {bo('Your username')}", "")
@@ -542,8 +631,8 @@ def client_flow():
     ], colour=bl))
     print()
 
-    here = Path(__file__).parent
-    noeyes = here / "noeyes.py"
+    root = Path(__file__).parent.parent
+    noeyes = root / "noeyes.py"
     cmd = [sys.executable, str(noeyes), "--connect", host,
            "--port", str(port), "--key-file", key_path]
     if username:
@@ -558,7 +647,10 @@ def client_flow():
     print(f"  {cy('Connecting...')}\n")
     show_cursor()
     try:
-        subprocess.run(cmd)
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"\n  {rd('Connection exited with error code')} {result.returncode}")
+            input("\n  Press Enter to return to menu...")
     except KeyboardInterrupt:
         pass
 

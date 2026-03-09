@@ -236,7 +236,7 @@ def load_identity(path: str) -> tuple[bytes, bytes]:
             import sys
             for attempt in range(3):
                 id_pass = _prompt_identity_password(confirm=False)
-                enc_fernet = derive_fernet_key(id_pass)
+                enc_fernet, _ = derive_fernet_key(id_pass)
                 try:
                     sk_bytes = enc_fernet.decrypt(data["sk_enc"].encode())
                     return sk_bytes, vk_bytes
@@ -284,7 +284,7 @@ def _save_identity_with_password(path: str, sk_bytes: bytes, password: str) -> N
         serialization.PublicFormat.Raw,
     )
     if password:
-        enc_fernet = derive_fernet_key(password)
+        enc_fernet, _ = derive_fernet_key(password)
         sk_enc = enc_fernet.encrypt(sk_bytes).decode()
         payload = {"encrypted": True, "sk_enc": sk_enc, "vk_hex": vk_bytes.hex()}
     else:

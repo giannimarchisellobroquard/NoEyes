@@ -648,6 +648,91 @@ def check_bore():
     except FileNotFoundError:
         return False
 
+
+
+def _add_to_windows_path_permanently(directory):
+    """Add a directory to the Windows user PATH permanently via the registry."""
+    if sys.platform != "win32":
+        return
+    directory = str(directory)
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Environment",
+            0, winreg.KEY_READ | winreg.KEY_WRITE
+        )
+        try:
+            current, _ = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            current = ""
+        if directory.lower() not in current.lower():
+            new_path = current + ";" + directory if current else directory
+            winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, new_path)
+            winreg.CloseKey(key)
+            # Notify running programs of the PATH change
+            try:
+                import ctypes
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                ctypes.windll.user32.SendMessageTimeoutW(
+                    HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", 2, 5000, None
+                )
+            except Exception:
+                pass
+            return True  # was added
+        winreg.CloseKey(key)
+        return False  # already there
+    except Exception:
+        return False
+
+def _install_bore_windows(cargo_bin):
+    """Download pre-built bore.exe from GitHub releases — no Rust compiler needed."""
+    import urllib.request, zipfile, tempfile, shutil
+    
+    # Get latest release tag from GitHub API
+    api_url = "https://api.github.com/repos/ekzhang/bore/releases/latest"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "NoEyes-installer"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            import json
+            data = json.loads(resp.read())
+            tag = data["tag_name"]  # e.g. "v0.5.0"
+    except Exception as e:
+        return False, f"Could not fetch bore release info: {e}"
+
+    zip_url = f"https://github.com/ekzhang/bore/releases/download/{tag}/bore-{tag}-x86_64-pc-windows-msvc.zip"
+    try:
+        tmp_zip = str(Path(tempfile.gettempdir()) / "bore-windows.zip")
+        with urllib.request.urlopen(zip_url, timeout=60) as resp:
+            open(tmp_zip, "wb").write(resp.read())
+        
+        # Extract bore.exe to ~/.cargo/bin (already on PATH from cargo installs)
+        dest_dir = Path.home() / ".cargo" / "bin"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        
+        with zipfile.ZipFile(tmp_zip) as zf:
+            for name in zf.namelist():
+                if name.endswith("bore.exe") or name == "bore.exe":
+                    with zf.open(name) as src, open(dest_dir / "bore.exe", "wb") as dst:
+                        dst.write(src.read())
+                    break
+        
+        os.unlink(tmp_zip)
+        
+        # Add to PATH for this session and permanently in Windows registry
+        cargo_bin_str = str(dest_dir)
+        if cargo_bin_str not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = cargo_bin_str + os.pathsep + os.environ.get("PATH", "")
+        _add_to_windows_path_permanently(cargo_bin_str)
+        
+        bore_exe = dest_dir / "bore.exe"
+        if bore_exe.exists():
+            return True, str(bore_exe)
+        return False, "bore.exe not found after extraction"
+    except Exception as e:
+        return False, str(e)
+
 def install_bore():
     """
     Install bore-cli — no sudo needed anywhere.
@@ -677,10 +762,16 @@ def install_bore():
             return True
         warn("pkg install bore failed — trying cargo...")
 
-    # ── Windows: cargo install or winget ─────────────────────────────────────
+    # ── Windows: download pre-built exe from GitHub (no compiler needed) ────
     if P.system == "Windows":
-        # winget doesn't have bore yet; fall through to cargo
-        pass
+        info("Windows detected — downloading pre-built bore.exe from GitHub...")
+        success, result = _install_bore_windows(cargo_bin)
+        if success:
+            ok(f"bore installed: {result}")
+            ok("bore binary: " + result)
+            info("NOTE: open a NEW terminal for bore to be recognised in PATH")
+            return True
+        warn(f"Pre-built download failed ({result}) — trying cargo compile...")
 
     # ── Ensure cargo is available ─────────────────────────────────────────────
     cargo_ok = False
@@ -694,14 +785,29 @@ def install_bore():
         info("cargo not found — installing Rust via rustup (no sudo, user-local)...")
         import urllib.request
         try:
-            url = "https://sh.rustup.rs"
-            with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
-                tmp = f.name
-            with urllib.request.urlopen(url) as resp:
-                open(tmp, "wb").write(resp.read())
-            os.chmod(tmp, 0o755)
-            r = run(["sh", tmp, "-y", "--no-modify-path"], check=False)
-            os.unlink(tmp)
+            if P.system == "Windows":
+                # Windows needs rustup-init.exe, not the shell script
+                url = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
+                tmp = str(Path(tempfile.gettempdir()) / "rustup-init.exe")
+                with urllib.request.urlopen(url) as resp:
+                    open(tmp, "wb").write(resp.read())
+                r = run([tmp, "-y", "--no-modify-path"], check=False)
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+            else:
+                url = "https://sh.rustup.rs"
+                with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
+                    tmp = f.name
+                with urllib.request.urlopen(url) as resp:
+                    open(tmp, "wb").write(resp.read())
+                os.chmod(tmp, 0o755)
+                r = run(["sh", tmp, "-y", "--no-modify-path"], check=False)
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
             if r and r.returncode == 0:
                 os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
                 cargo_env["PATH"] = cargo_bin + os.pathsep + cargo_env.get("PATH", "")
@@ -722,10 +828,17 @@ def install_bore():
         # Expose bore in this process's PATH too
         if cargo_bin not in os.environ.get("PATH", ""):
             os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
-        if check_bore():
+        # Permanently add to Windows user PATH so new terminals see it
+        if P.system == "Windows":
+            _add_to_windows_path_permanently(cargo_bin)
+        # Check directly for the binary in ~/.cargo/bin in case PATH isn't refreshed yet
+        bore_bin = Path.home() / ".cargo" / "bin" / ("bore.exe" if P.system == "Windows" else "bore")
+        if check_bore() or bore_bin.exists():
             ok("bore installed — bore.pub tunnel ready")
+            ok(f"bore binary: {bore_bin}")
+            if P.system == "Windows":
+                info("NOTE: open a NEW terminal window for bore to be recognised in PATH")
             info("Start a tunnelled server with:  python noeyes.py --server")
-            info("(bore starts automatically — no extra flags needed)")
             return True
     err("cargo install bore-cli failed")
     info("You can try manually later:  cargo install bore-cli")
@@ -788,10 +901,10 @@ def verify():
     else:
         info("bore not installed — needed only to host a server online")
 
-    here = Path(__file__).parent
-    core = ["noeyes.py", "server.py", "client.py", "encryption.py",
-            "identity.py", "utils.py", "config.py"]
-    missing = [f for f in core if not (here / f).exists()]
+    root = Path(__file__).parent.parent
+    core = ["noeyes.py", "network/server.py", "network/client.py", "core/encryption.py",
+            "core/identity.py", "core/utils.py", "core/config.py"]
+    missing = [f for f in core if not (root / f).exists()]
     if missing:
         warn(f"Missing NoEyes files: {', '.join(missing)}")
     else:
@@ -834,10 +947,10 @@ def check_only():
     else:
         info("bore: not installed  (optional — needed only to host a server online)")
 
-    here = Path(__file__).parent
-    core = ["noeyes.py", "server.py", "client.py", "encryption.py",
-            "identity.py", "utils.py", "config.py"]
-    missing = [f for f in core if not (here / f).exists()]
+    root = Path(__file__).parent.parent
+    core = ["noeyes.py", "network/server.py", "network/client.py", "core/encryption.py",
+            "core/identity.py", "core/utils.py", "core/config.py"]
+    missing = [f for f in core if not (root / f).exists()]
     (warn if missing else ok)(
         f"NoEyes files: " + (f"missing {missing}" if missing else "all present"))
 

@@ -310,7 +310,7 @@ class NoEyesServer:
 
     async def _main(self) -> None:
         import ssl as _ssl
-        import encryption as _enc
+        from core import encryption as _enc
 
         # ── Auto-TLS ──────────────────────────────────────────────────────────
         # NoEyes always uses TLS to protect transport metadata (usernames, room
@@ -356,7 +356,7 @@ class NoEyesServer:
         async with server:
             addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
             if ssl_ctx:
-                import encryption as _enc2
+                from core import encryption as _enc2
                 cert_path = self.ssl_cert or "~/.noeyes/server.crt"
                 fp = _enc2.get_tls_fingerprint(cert_path)
                 proto = f"TLS — fingerprint: {fp[:16]}...{fp[-16:]}"
@@ -378,7 +378,17 @@ class NoEyesServer:
     ) -> None:
         addr = writer.get_extra_info("peername")
         conn = ClientConn(writer, addr)
+        # Log full IP only at DEBUG so it never appears in default INFO logs.
+        # At INFO we log only an anonymised prefix (first two octets / 64-bit
+        # IPv6 prefix) so operators get some geographic signal without storing
+        # the full address in log files that might be world-readable.
+        import hashlib as _hl
+        _ip = str(addr[0]) if addr else "?"
+        _ip_anon = ".".join(_ip.split(".")[:2]) + ".*.*" if "." in _ip \
+            else ":".join(_ip.split(":")[:4]) + ":…"
         logger.debug("New connection from %s", addr)
+        logger.info("New connection from %s", _ip_anon)
+        print(f"  [server] Incoming connection from {_ip_anon}", flush=True)
 
         try:
             # First frame must be a join event
@@ -402,15 +412,86 @@ class NoEyesServer:
             if not username:
                 return
 
-            # Reject duplicate username
+            # Handle duplicate username:
+            # Branch 1 — dead session: require pubkey match if we have a stored key,
+            #   so a crashed user's slot cannot be sniped by anyone who notices the
+            #   gap before the server cleans up.
+            # Branch 2 — live session, same pubkey claimed: issue a challenge nonce
+            #   and require the client to sign it with their Ed25519 private key.
+            #   This proves ownership of the key and prevents an attacker who merely
+            #   observed the public key from impersonating the user.
+            # Branch 3 — everything else: reject.
             if username in self._clients:
-                await send_frame(writer, {
-                    "type":    "system",
-                    "event":   "nick_error",
-                    "message": f"Username '{username}' is already taken.",
-                    "ts":      _now_ts(),
-                })
-                return
+                old_conn = self._clients[username]
+                if not old_conn.alive:
+                    # Dead session — evict only if pubkey matches (or no key stored yet)
+                    stored_key = self._pubkeys.get(username)
+                    if stored_key and vk_hex != stored_key:
+                        await send_frame(writer, {
+                            "type":    "system",
+                            "event":   "nick_error",
+                            "message": f"Username '{username}' is already taken.",
+                            "ts":      _now_ts(),
+                        })
+                        return
+                    self._clients.pop(username, None)
+                    try:
+                        old_conn.writer.close()
+                    except Exception:
+                        pass
+                elif vk_hex and self._pubkeys.get(username) == vk_hex:
+                    # Same pubkey claimed — challenge before allowing takeover.
+                    import os as _os
+                    nonce = _os.urandom(32).hex()
+                    await send_frame(writer, {
+                        "type":  "system",
+                        "event": "auth_challenge",
+                        "nonce": nonce,
+                        "ts":    _now_ts(),
+                    })
+                    try:
+                        resp = await asyncio.wait_for(recv_frame(reader), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        return
+                    if resp is None:
+                        return
+                    resp_header, _ = resp
+                    if resp_header.get("type") != "system" or \
+                            resp_header.get("event") != "auth_response":
+                        return
+                    sig_hex = str(resp_header.get("sig", "")).strip()
+                    try:
+                        from core import encryption as _enc
+                        _verified = _enc.verify_signature(
+                            bytes.fromhex(vk_hex),
+                            nonce.encode(),
+                            bytes.fromhex(sig_hex),
+                        )
+                    except Exception:
+                        _verified = False
+                    if not _verified:
+                        await send_frame(writer, {
+                            "type":    "system",
+                            "event":   "nick_error",
+                            "message": "Authentication failed — could not verify identity key.",
+                            "ts":      _now_ts(),
+                        })
+                        return
+                    # Verified — kick stale session and let new one take over
+                    old_conn.alive = False
+                    self._clients.pop(username, None)
+                    try:
+                        old_conn.writer.close()
+                    except Exception:
+                        pass
+                else:
+                    await send_frame(writer, {
+                        "type":    "system",
+                        "event":   "nick_error",
+                        "message": f"Username '{username}' is already taken.",
+                        "ts":      _now_ts(),
+                    })
+                    return
 
             conn.username = username
             conn.room     = room
@@ -428,6 +509,15 @@ class NoEyesServer:
 
             if vk_hex:
                 self._pubkeys[username] = vk_hex
+
+            # Acknowledge the join before replaying history.
+            # This gives the client a single deterministic signal that the
+            # handshake is complete and history frames are about to follow.
+            await send_frame(writer, {
+                "type":  "system",
+                "event": "auth_ok",
+                "ts":    _now_ts(),
+            })
 
             # Replay history to the new joiner
             history_snapshot = list(self._history[room])
