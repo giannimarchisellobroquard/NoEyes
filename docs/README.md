@@ -4,25 +4,27 @@
 
 ## See it in action
 
-
-https://github.com/user-attachments/assets/c64bc1f9-352e-4d4d-88a3-66cec53adb4f
-
-**Security features demo** — group chat, private messages, identity verification, TOFU key trust:
+### Full Showcase — 3 clients, rooms, private messages, sidebar panel
 
 
-[![asciicast](https://asciinema.org/a/qqXxaI5H9UQ3fIMf.svg)](https://asciinema.org/a/qqXxaI5H9UQ3fIMf)
 
 ---
 
-**Install demo 1 — `sh install.sh`** (no Python required):
+### install.sh — Bootstrap installer
 
-[![asciicast](https://asciinema.org/a/WFlG0y6hcn2X4rB6.svg)](https://asciinema.org/a/WFlG0y6hcn2X4rB6)
+
 
 ---
 
-**Install demo 2 — `python ui/setup.py`** (guided wizard):
+### install.py — Universal Python installer
 
-[![asciicast](https://asciinema.org/a/33CtfifXVdPOsiVA.svg)](https://asciinema.org/a/33CtfifXVdPOsiVA)
+
+
+---
+
+### Server — Guided launcher startup
+
+
 
 ---
 
@@ -144,7 +146,7 @@ termux-setup-storage
 | `/quit` | Disconnect and exit |
 | `/clear` | Clear screen |
 | `/users` | List users in current room |
-| `/nick <name>` | Change your display name |
+| `/nick <n>` | Change your display name |
 | `/join <room>` | Switch to a room (created automatically) |
 | `/leave` | Return to the general room |
 | `/msg <user> <text>` | Send an E2E-encrypted private message |
