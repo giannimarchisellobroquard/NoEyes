@@ -89,7 +89,7 @@ Both scripts install Python if missing, then hand off to `setup.py` automaticall
 
 ---
 
-### Option C - Manual (advanced users)
+### Option C - Manual
 
 ```bash
 # 1. Install dependencies
